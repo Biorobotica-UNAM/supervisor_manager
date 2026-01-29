@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    
+    <node pkg="supervisor_plan" exec="supervisor_plan_node" name="supervisor_plan_node" output="screen">
+    </node>
+
+</launch>
