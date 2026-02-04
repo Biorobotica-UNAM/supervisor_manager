@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    <arg    name="namespace"
+            default="supervisor"
+            description="Top-level namespace for all supervisor nodes"/>  
+
+    <group>
+        <push-ros-namespace namespace="$(var namespace)"/>
+    
+        <node   
+            pkg="supervisor_plan" 
+            exec="supervisor_plan_node" 
+            name="supervisor_plan_node" 
+            output="screen">
+        </node>
+
+        <node
+            pkg="supervisor_system"
+            exec="supervisor_system_node"
+            name="supervisor_system_node"
+            output="screen">
+        </node>
+
+        <node
+            pkg="supervisor_manager"
+            exec="supervisor_manager_node"
+            name="supervisor_manager_node"
+            output="screen">
+        </node>
+    </group>
+</launch>
