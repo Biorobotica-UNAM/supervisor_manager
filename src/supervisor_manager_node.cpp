@@ -97,7 +97,7 @@ class SupervisorManagerNode : public rclcpp::Node
 
                 default:
                     RCLCPP_ERROR(this->get_logger(), "Estado desconocido, reiniciando FSM");
-                    state_ = State::SM_START
+                    state_ = State::SM_START;
                     break;
                 
     
@@ -110,7 +110,7 @@ rclcpp::Subscription<supervisor_interfaces::msg::SystemStatus>::SharedPtr sub_;
 rclcpp::TimerBase::SharedPtr timer_;
 
 // Estado FSM
-State state_{State::START};
+State state_{State::SM_START};
 
 // Último mensaje recibido
 std::mutex mtx_;
