@@ -11,9 +11,8 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(supervisor_interfaces)
-# uncomment the following section in order to fill in
-# further dependencies manually.
-# find_package(<dependency> REQUIRED)
+find_package(planning_tools REQUIRED)
+find_package(clips_interfaces REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 
 
@@ -45,6 +44,8 @@ ament_target_dependencies(supervisor_manager_node
   std_msgs
   std_srvs
   supervisor_interfaces
+  clips_interfaces
+  planning_tools
 )
 
 # Install executables
