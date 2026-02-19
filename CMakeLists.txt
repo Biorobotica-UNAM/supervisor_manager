@@ -10,20 +10,19 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
-find_package(supervisor_interfaces)
+
+find_package(supervisor_interfaces REQUIRED)
 find_package(planning_tools REQUIRED)
 find_package(clips_interfaces REQUIRED)
-find_package(Boost REQUIRED COMPONENTS system)
 
+# NEW: for supervisor_executor_interfaces/srv/AuthorizeTask
+find_package(supervisor_executor_interfaces REQUIRED)
+
+find_package(Boost REQUIRED COMPONENTS system)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
@@ -32,10 +31,10 @@ add_executable(supervisor_manager_node src/supervisor_manager_node.cpp)
 
 target_include_directories(supervisor_manager_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-  
+  $<INSTALL_INTERFACE:include>
+)
+
 target_link_libraries(supervisor_manager_node
-  ${rclcpp_LIBRARIES}
   ${Boost_LIBRARIES}
 )
 
@@ -46,9 +45,9 @@ ament_target_dependencies(supervisor_manager_node
   supervisor_interfaces
   clips_interfaces
   planning_tools
+  supervisor_executor_interfaces   # NEW
 )
 
-# Install executables
 install(TARGETS
   supervisor_manager_node
   DESTINATION lib/${PROJECT_NAME}
@@ -59,15 +58,15 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
-# Install include directories
-#install(DIRECTORY include/
-#  DESTINATION include
-#)
-
-# Export dependencies
 ament_export_include_directories(include)
-ament_export_libraries(supervisor_plan_node)
-ament_export_dependencies(rclcpp std_msgs)
-
+ament_export_dependencies(
+  rclcpp
+  std_msgs
+  std_srvs
+  supervisor_interfaces
+  clips_interfaces
+  planning_tools
+  supervisor_executor_interfaces   # NEW
+)
 
 ament_package()
