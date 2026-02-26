@@ -17,11 +17,6 @@
   <depend>clips_interfaces</depend>
   <depend>planning_tools</depend>
 
-  <!-- NEW -->
-  <depend>supervisor_executor_interfaces</depend>
-
-  <depend>boost</depend>
-
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

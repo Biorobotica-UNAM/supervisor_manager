@@ -15,11 +15,6 @@ find_package(supervisor_interfaces REQUIRED)
 find_package(planning_tools REQUIRED)
 find_package(clips_interfaces REQUIRED)
 
-# NEW: for supervisor_executor_interfaces/srv/AuthorizeTask
-find_package(supervisor_executor_interfaces REQUIRED)
-
-find_package(Boost REQUIRED COMPONENTS system)
-
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
@@ -34,10 +29,6 @@ target_include_directories(supervisor_manager_node PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(supervisor_manager_node
-  ${Boost_LIBRARIES}
-)
-
 ament_target_dependencies(supervisor_manager_node
   rclcpp
   std_msgs
@@ -45,7 +36,6 @@ ament_target_dependencies(supervisor_manager_node
   supervisor_interfaces
   clips_interfaces
   planning_tools
-  supervisor_executor_interfaces   # NEW
 )
 
 install(TARGETS
@@ -66,7 +56,6 @@ ament_export_dependencies(
   supervisor_interfaces
   clips_interfaces
   planning_tools
-  supervisor_executor_interfaces   # NEW
 )
 
 ament_package()

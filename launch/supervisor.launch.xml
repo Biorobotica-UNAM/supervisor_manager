@@ -7,12 +7,12 @@
     <group>
         <push-ros-namespace namespace="$(var namespace)"/>
     
-        <node   
+        <!--node   
             pkg="supervisor_plan" 
             exec="supervisor_plan_node" 
             name="supervisor_plan_node" 
             output="screen">
-        </node>
+        </node-->
 
         <node
             pkg="supervisor_system"
@@ -21,11 +21,18 @@
             output="screen">
         </node>
 
-        <!--<node
+        <!--node
+            pkg="dev-supervisor-execution"
+            exec="supervisor_execution_node"
+            name="supervisor_execution_node"
+            output="screen">
+        </node-->
+
+        <!--node
             pkg="supervisor_manager"
             exec="supervisor_manager_node"
             name="supervisor_manager_node"
             output="screen">
-        </node>-->
+        </node-->
     </group>
 </launch>

@@ -3,6 +3,8 @@
 #include <supervisor_interfaces/msg/system_status.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <mutex>
@@ -10,7 +12,6 @@
 #include <string>
 
 #include <planning_tools/Planning.hpp>
-#include "supervisor_executor_interfaces/srv/authorize_task.hpp"
 
 using namespace std::chrono_literals;
 
@@ -28,25 +29,28 @@ public:
       std::bind(&SupervisorManagerNode::statusCallback, this, std::placeholders::_1)
     );
 
+    execution_feedback_sub_ = this->create_subscription<std_msgs::msg::String>(
+      "/supervisor/supervisor_execution/result",
+      rclcpp::QoS(10),
+      std::bind(&SupervisorManagerNode::executionFeedbackCallback, this, std::placeholders::_1)
+    );
+    plan_active_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+      "/supervisor/supervisor_plan/active",
+      rclcpp::QoS(10),
+      std::bind(&SupervisorManagerNode::planActiveCallback, this, std::placeholders::_1)
+    );
+
     // --- Publishers ---
-    input_trigger_pub_   = this->create_publisher<std_msgs::msg::Empty>("/input_trigger", 10);
+    allow_next_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
+      "/supervisor/supervisor_manager/allow_next_instruction", 10);
+    allow_plan_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
+      "/supervisor/supervisor_manager/allow_plan_instruction", 10);
     instruction_cmd_pub_ = this->create_publisher<std_msgs::msg::Int32>(
       "/supervisor/supervisor_manager/instruction_command", 10);
 
     // --- Clients ---
     start_planning_client_ =
       this->create_client<std_srvs::srv::Trigger>("/planning/clips/start_planning");
-
-    // --- Service server ---
-    authorize_task_srv_ = this->create_service<supervisor_executor_interfaces::srv::AuthorizeTask>(
-      "/supervisor/supervisor_executor/authorize",
-      std::bind(
-        &SupervisorManagerNode::authorizeTaskCallback,
-        this,
-        std::placeholders::_1,
-        std::placeholders::_2
-      )
-    );
 
     // --- FSM Timer (10 Hz) ---
     timer_ = this->create_wall_timer(
@@ -70,9 +74,8 @@ private:
     SM_CREATE_PLAN,          // parse + primitiveToClips
     SM_SEND_START_PLANNING,  // send /planning/clips/start_planning (once)
     SM_WAIT_PLAN_RESPONSE,   // wait for response (non-blocking)
-    SM_POST_PLAN_TRIGGER,    // publish /input_trigger (one-shot)
-
-    SM_WAIT_AUTHORIZE        // wait for authorize service call
+    SM_POST_PLAN_TRIGGER,      // allow execution to request first instruction
+    SM_WAIT_EXECUTION_RESULT   // manager waits execution feedback and decides next move
   };
 
   // ===== One-shot init =====
@@ -91,18 +94,18 @@ private:
     got_status_ = true;
   }
 
-  void authorizeTaskCallback(
-    const supervisor_executor_interfaces::srv::AuthorizeTask::Request::SharedPtr req,
-    supervisor_executor_interfaces::srv::AuthorizeTask::Response::SharedPtr res)
+  void executionFeedbackCallback(const std_msgs::msg::String::SharedPtr msg)
   {
-    // Default: no bloquear por ahora
-    res->approved = true;
-    res->message  = "ok";
-
-    // Guardamos "evento" para FSM, NO publicamos triggers aquí (evita encadenamientos raros)
     std::lock_guard<std::mutex> lock(mtx_);
-    last_authorize_req_ = *req;
-    got_authorize_ = true;
+    last_execution_feedback_ = msg->data;
+    got_execution_feedback_ = true;
+  }
+
+  void planActiveCallback(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    plan_active_ = msg->data;
+    got_plan_active_ = true;
   }
 
   // ===== Helpers =====
@@ -114,19 +117,36 @@ private:
     return true;
   }
 
-  bool consumeAuthorize(supervisor_executor_interfaces::srv::AuthorizeTask::Request & out)
+  bool consumeExecutionFeedback(std::string & out)
   {
     std::lock_guard<std::mutex> lock(mtx_);
-    if (!got_authorize_ || !last_authorize_req_.has_value()) return false;
-    out = *last_authorize_req_;
-    got_authorize_ = false;
-    last_authorize_req_.reset();
+    if (!got_execution_feedback_ || !last_execution_feedback_.has_value()) {
+      return false;
+    }
+    out = *last_execution_feedback_;
+    got_execution_feedback_ = false;
+    last_execution_feedback_.reset();
     return true;
   }
 
-  void publishInputTriggerOnce()
+  void publishAllowNextCycle()
   {
-    input_trigger_pub_->publish(std_msgs::msg::Empty{});
+    allow_plan_instruction_pub_->publish(std_msgs::msg::Empty{});
+    allow_next_instruction_pub_->publish(std_msgs::msg::Empty{});
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Manager semaphore: allow one plan dispatch + allow execution trigger"
+    );
+  }
+
+  bool getPlanActiveStatus(bool & out)
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!got_plan_active_) {
+      return false;
+    }
+    out = plan_active_;
+    return true;
   }
 
   void publishRetryCommand()
@@ -134,6 +154,20 @@ private:
     std_msgs::msg::Int32 msg;
     msg.data = 1;
     instruction_cmd_pub_->publish(msg);
+  }
+
+  bool parseExecutionFeedback(
+    const std::string & feedback,
+    std::string & action,
+    std::string & result)
+  {
+    const auto sep = feedback.find(':');
+    if (sep == std::string::npos || sep == 0U || sep == feedback.size() - 1U) {
+      return false;
+    }
+    action = feedback.substr(0, sep);
+    result = feedback.substr(sep + 1);
+    return true;
   }
 
   // ===== FSM Tick =====
@@ -220,7 +254,8 @@ private:
         RCLCPP_INFO(this->get_logger(), "SM_SEND_START_PLANNING: calling /planning/clips/start_planning");
 
         auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
-        start_planning_future_ = start_planning_client_->async_send_request(req);
+        auto future_and_id = start_planning_client_->async_send_request(req);
+        start_planning_future_ = future_and_id.future.share();
         start_planning_sent_ = true;
 
         state_ = State::SM_WAIT_PLAN_RESPONSE;
@@ -267,58 +302,82 @@ private:
 
       case State::SM_POST_PLAN_TRIGGER:
       {
-        RCLCPP_INFO(this->get_logger(), "SM_POST_PLAN_TRIGGER: publishing /input_trigger (one-shot) -> WAIT_AUTHORIZE");
-        publishInputTriggerOnce();
-        RCLCPP_INFO(this->get_logger(), "aquiiii");
-        state_ = State::SM_WAIT_AUTHORIZE;
+        RCLCPP_INFO(
+          this->get_logger(),
+          "SM_POST_PLAN_TRIGGER: plan ready -> allow execution to request first instruction"
+        );
+        publishAllowNextCycle();
+        state_ = State::SM_WAIT_EXECUTION_RESULT;
         break;
       }
 
-      case State::SM_WAIT_AUTHORIZE:
+      case State::SM_WAIT_EXECUTION_RESULT:
       {
-        RCLCPP_INFO(this->get_logger(), "SM_WAIT_AUTHORIZE: waiting for authorize_task...");
-        supervisor_executor_interfaces::srv::AuthorizeTask::Request req;
-        if (!consumeAuthorize(req))
+        std::string feedback;
+        if (!consumeExecutionFeedback(feedback))
         {
           RCLCPP_DEBUG_THROTTLE(
             this->get_logger(), *this->get_clock(), 2000,
-            "SM_WAIT_AUTHORIZE: waiting for author111."
+            "SM_WAIT_EXECUTION_RESULT: waiting execution feedback..."
           );
           break;
         }
 
-        // --- Aquí sí va tu lógica de Check ---
-        if (req.action == "Check")
+        std::string action;
+        std::string result;
+        if (!parseExecutionFeedback(feedback, action, result))
         {
-          if (req.worker_result == "success")
-          {
-            RCLCPP_INFO(this->get_logger(), "authorize(Check): success -> publish /input_trigger and keep waiting");
-            publishInputTriggerOnce();          // ✅ 1 vez por evento
-            state_ = State::SM_WAIT_AUTHORIZE;  // sigue esperando el siguiente authorize
-            break;
-          }
-
-          if (req.worker_result == "failure")
-          {
-            RCLCPP_WARN(this->get_logger(), "authorize(Check): failure -> publish retry=1 and /input_trigger");
-            publishRetryCommand();
-            publishInputTriggerOnce();          // ✅ 1 vez por evento
-            state_ = State::SM_WAIT_AUTHORIZE;
-            break;
-          }
-
-          RCLCPP_WARN(this->get_logger(),
-                      "authorize(Check): unknown worker_result='%s' (no trigger)",
-                      req.worker_result.c_str());
-          state_ = State::SM_WAIT_AUTHORIZE;
+          RCLCPP_WARN(
+            this->get_logger(),
+            "SM_WAIT_EXECUTION_RESULT: malformed feedback='%s'",
+            feedback.c_str()
+          );
           break;
         }
 
-        // no es Check
-        RCLCPP_DEBUG(this->get_logger(),
-                     "authorize: action='%s' (no special logic, no trigger)",
-                     req.action.c_str());
-        state_ = State::SM_WAIT_AUTHORIZE;
+        RCLCPP_INFO(
+          this->get_logger(),
+          "SM_WAIT_EXECUTION_RESULT: feedback action='%s' result='%s'",
+          action.c_str(), result.c_str()
+        );
+
+        if (action == "Check" && result == "failure")
+        {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "SM_WAIT_EXECUTION_RESULT: Check failure -> retry current instruction"
+          );
+          publishRetryCommand();
+        }
+
+        if (result == "success" || result == "failure")
+        {
+          bool active_plan = false;
+          if (getPlanActiveStatus(active_plan))
+          {
+            RCLCPP_INFO(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: plan_active=%s before next cycle",
+              active_plan ? "true" : "false"
+            );
+          }
+          else
+          {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: plan_active status not received yet"
+            );
+          }
+
+          publishAllowNextCycle();
+          break;
+        }
+
+        RCLCPP_WARN(
+          this->get_logger(),
+          "SM_WAIT_EXECUTION_RESULT: result='%s' not actionable",
+          result.c_str()
+        );
         break;
       }
 
@@ -333,14 +392,16 @@ private:
 
   // ===== ROS =====
   rclcpp::Subscription<supervisor_interfaces::msg::SystemStatus>::SharedPtr sub_status_;
-  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr input_trigger_pub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr execution_feedback_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr plan_active_sub_;
+
+  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_next_instruction_pub_;
+  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_plan_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr instruction_cmd_pub_;
 
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr start_planning_client_;
   std::shared_future<std::shared_ptr<std_srvs::srv::Trigger::Response>> start_planning_future_;
   bool start_planning_sent_{false};
-
-  rclcpp::Service<supervisor_executor_interfaces::srv::AuthorizeTask>::SharedPtr authorize_task_srv_;
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
@@ -356,9 +417,10 @@ private:
   std::optional<supervisor_interfaces::msg::SystemStatus> last_status_;
   bool got_status_{false};
 
-  // Authorize event (store last request)
-  std::optional<supervisor_executor_interfaces::srv::AuthorizeTask::Request> last_authorize_req_;
-  bool got_authorize_{false};
+  std::optional<std::string> last_execution_feedback_;
+  bool got_execution_feedback_{false};
+  bool plan_active_{false};
+  bool got_plan_active_{false};
 };
 
 int main(int argc, char ** argv)
