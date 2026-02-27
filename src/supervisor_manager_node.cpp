@@ -378,6 +378,7 @@ private:
           "SM_WAIT_EXECUTION_RESULT: result='%s' not actionable",
           result.c_str()
         );
+        publishAllowNextCycle();
         break;
       }
 
