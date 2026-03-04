@@ -12,13 +12,10 @@
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
+
   <depend>supervisor_interfaces</depend>
-    <depend>clips_interfaces</depend>
-
-    <depend>planning_tools</depend>
-
-
-    <depend>boost</depend>
+  <depend>clips_interfaces</depend>
+  <depend>planning_tools</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

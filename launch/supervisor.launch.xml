@@ -21,11 +21,18 @@
             output="screen">
         </node>
 
-        <!--<node
+        <node
+            pkg="supervisor_execution"
+            exec="supervisor_execution_node"
+            name="supervisor_execution_node"
+            output="screen">
+        </node>
+
+        <!--node
             pkg="supervisor_manager"
             exec="supervisor_manager_node"
             name="supervisor_manager_node"
             output="screen">
-        </node>-->
+        </node-->
     </group>
 </launch>
