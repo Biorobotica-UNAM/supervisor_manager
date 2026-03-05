@@ -1,12 +1,13 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <supervisor_interfaces/msg/system_status.hpp>
+#include <supervisor_interfaces/msg/task_execution_report.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/int32.hpp>
-#include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <std_srvs/srv/trigger.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -29,7 +30,8 @@ public:
       std::bind(&SupervisorManagerNode::statusCallback, this, std::placeholders::_1)
     );
 
-    execution_feedback_sub_ = this->create_subscription<std_msgs::msg::String>(
+    execution_feedback_sub_ =
+      this->create_subscription<supervisor_interfaces::msg::TaskExecutionReport>(
       "/supervisor/supervisor_execution/result",
       rclcpp::QoS(10),
       std::bind(&SupervisorManagerNode::executionFeedbackCallback, this, std::placeholders::_1)
@@ -39,6 +41,11 @@ public:
       rclcpp::QoS(10),
       std::bind(&SupervisorManagerNode::planActiveCallback, this, std::placeholders::_1)
     );
+    plan_ready_sub_ = this->create_subscription<std_msgs::msg::Empty>(
+      "/supervisor/supervisor_plan/plan_ready",
+      rclcpp::QoS(10),
+      std::bind(&SupervisorManagerNode::planReadyCallback, this, std::placeholders::_1)
+    );
 
     // --- Publishers ---
     allow_next_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
@@ -47,10 +54,6 @@ public:
       "/supervisor/supervisor_manager/allow_plan_instruction", 10);
     instruction_cmd_pub_ = this->create_publisher<std_msgs::msg::Int32>(
       "/supervisor/supervisor_manager/instruction_command", 10);
-
-    // --- Clients ---
-    start_planning_client_ =
-      this->create_client<std_srvs::srv::Trigger>("/planning/clips/start_planning");
 
     // --- FSM Timer (10 Hz) ---
     timer_ = this->create_wall_timer(
@@ -72,8 +75,7 @@ private:
     SM_VERIFY_SYS,
 
     SM_CREATE_PLAN,          // parse + primitiveToClips
-    SM_SEND_START_PLANNING,  // send /planning/clips/start_planning (once)
-    SM_WAIT_PLAN_RESPONSE,   // wait for response (non-blocking)
+    SM_WAIT_PLAN_READY,      // wait notification from supervisor_plan
     SM_POST_PLAN_TRIGGER,      // allow execution to request first instruction
     SM_WAIT_EXECUTION_RESULT   // manager waits execution feedback and decides next move
   };
@@ -94,10 +96,11 @@ private:
     got_status_ = true;
   }
 
-  void executionFeedbackCallback(const std_msgs::msg::String::SharedPtr msg)
+  void executionFeedbackCallback(
+    const supervisor_interfaces::msg::TaskExecutionReport::SharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(mtx_);
-    last_execution_feedback_ = msg->data;
+    last_execution_feedback_ = *msg;
     got_execution_feedback_ = true;
   }
 
@@ -106,6 +109,13 @@ private:
     std::lock_guard<std::mutex> lock(mtx_);
     plan_active_ = msg->data;
     got_plan_active_ = true;
+  }
+
+  void planReadyCallback(const std_msgs::msg::Empty::SharedPtr msg)
+  {
+    (void)msg;
+    std::lock_guard<std::mutex> lock(mtx_);
+    plan_ready_signal_ = true;
   }
 
   // ===== Helpers =====
@@ -117,7 +127,7 @@ private:
     return true;
   }
 
-  bool consumeExecutionFeedback(std::string & out)
+  bool consumeExecutionFeedback(supervisor_interfaces::msg::TaskExecutionReport & out)
   {
     std::lock_guard<std::mutex> lock(mtx_);
     if (!got_execution_feedback_ || !last_execution_feedback_.has_value()) {
@@ -149,6 +159,22 @@ private:
     return true;
   }
 
+  void clearPlanReadySignal()
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    plan_ready_signal_ = false;
+  }
+
+  bool consumePlanReadySignal()
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!plan_ready_signal_) {
+      return false;
+    }
+    plan_ready_signal_ = false;
+    return true;
+  }
+
   void publishRetryCommand()
   {
     std_msgs::msg::Int32 msg;
@@ -156,18 +182,16 @@ private:
     instruction_cmd_pub_->publish(msg);
   }
 
-  bool parseExecutionFeedback(
-    const std::string & feedback,
-    std::string & action,
-    std::string & result)
+  bool isCheckAction(const std::string & action) const
   {
-    const auto sep = feedback.find(':');
-    if (sep == std::string::npos || sep == 0U || sep == feedback.size() - 1U) {
-      return false;
-    }
-    action = feedback.substr(0, sep);
-    result = feedback.substr(sep + 1);
-    return true;
+    std::string normalized = action;
+    std::transform(
+      normalized.begin(),
+      normalized.end(),
+      normalized.begin(),
+      [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+
+    return normalized == "check" || normalized == "wait_for";
   }
 
   // ===== FSM Tick =====
@@ -233,70 +257,45 @@ private:
 
         RCLCPP_INFO(this->get_logger(), "Plan semantic parsed: %s", plan.c_str());
 
-        planning_->primitiveToClips(plan);
-        RCLCPP_INFO(this->get_logger(), "Plan sent to CLIPS (primitive_to_clips)");
+        clearPlanReadySignal();
 
-        state_ = State::SM_SEND_START_PLANNING;
-        break;
-      }
-
-      case State::SM_SEND_START_PLANNING:
-      {
-        if (!start_planning_client_->service_is_ready())
+        const std::string primitive_result = planning_->primitiveToClips(plan);
+        if (primitive_result.empty())
         {
-          RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000,
-            "SM_SEND_START_PLANNING: waiting for /planning/clips/start_planning..."
+          RCLCPP_ERROR(
+            this->get_logger(),
+            "SM_CREATE_PLAN: primitive_to_clips failed -> back to VERIFY"
           );
+          state_ = State::SM_VERIFY_SYS;
           break;
         }
 
-        RCLCPP_INFO(this->get_logger(), "SM_SEND_START_PLANNING: calling /planning/clips/start_planning");
+        RCLCPP_INFO(
+          this->get_logger(),
+          "Plan sent to CLIPS (primitive_to_clips): %s",
+          primitive_result.c_str()
+        );
 
-        auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
-        auto future_and_id = start_planning_client_->async_send_request(req);
-        start_planning_future_ = future_and_id.future.share();
-        start_planning_sent_ = true;
-
-        state_ = State::SM_WAIT_PLAN_RESPONSE;
+        state_ = State::SM_WAIT_PLAN_READY;
         break;
       }
 
-      case State::SM_WAIT_PLAN_RESPONSE:
+      case State::SM_WAIT_PLAN_READY:
       {
-        if (!start_planning_sent_ || !start_planning_future_.valid())
-        {
-          RCLCPP_WARN(this->get_logger(),
-                      "SM_WAIT_PLAN_RESPONSE: no future (start_planning not sent). Returning to SEND_START_PLANNING.");
-          state_ = State::SM_SEND_START_PLANNING;
-          break;
-        }
-
-        if (start_planning_future_.wait_for(0s) == std::future_status::ready)
-        {
-          auto resp = start_planning_future_.get();
-          start_planning_sent_ = false;
-
-          if (resp->success)
-          {
-            RCLCPP_INFO(this->get_logger(),
-                        "SM_WAIT_PLAN_RESPONSE: plan created OK: %s", resp->message.c_str());
-            state_ = State::SM_POST_PLAN_TRIGGER;
-          }
-          else
-          {
-            RCLCPP_ERROR(this->get_logger(),
-                        "SM_WAIT_PLAN_RESPONSE: planning failed: %s", resp->message.c_str());
-            state_ = State::SM_VERIFY_SYS;
-          }
-        }
-        else
+        if (!consumePlanReadySignal())
         {
           RCLCPP_DEBUG_THROTTLE(
-            this->get_logger(), *this->get_clock(), 1000,
-            "SM_WAIT_PLAN_RESPONSE: waiting response from /planning/clips/start_planning..."
+            this->get_logger(), *this->get_clock(), 2000,
+            "SM_WAIT_PLAN_READY: waiting for /supervisor/supervisor_plan/plan_ready..."
           );
+          break;
         }
+
+        RCLCPP_INFO(
+          this->get_logger(),
+          "SM_WAIT_PLAN_READY: supervisor_plan confirmed plan is ready"
+        );
+        state_ = State::SM_POST_PLAN_TRIGGER;
         break;
       }
 
@@ -313,7 +312,7 @@ private:
 
       case State::SM_WAIT_EXECUTION_RESULT:
       {
-        std::string feedback;
+        supervisor_interfaces::msg::TaskExecutionReport feedback;
         if (!consumeExecutionFeedback(feedback))
         {
           RCLCPP_DEBUG_THROTTLE(
@@ -323,34 +322,32 @@ private:
           break;
         }
 
-        std::string action;
-        std::string result;
-        if (!parseExecutionFeedback(feedback, action, result))
-        {
-          RCLCPP_WARN(
-            this->get_logger(),
-            "SM_WAIT_EXECUTION_RESULT: malformed feedback='%s'",
-            feedback.c_str()
-          );
-          break;
-        }
-
         RCLCPP_INFO(
           this->get_logger(),
-          "SM_WAIT_EXECUTION_RESULT: feedback action='%s' result='%s'",
-          action.c_str(), result.c_str()
+          "SM_WAIT_EXECUTION_RESULT: feedback action='%s' arg='%s' worker='%s' approved=%s status=%u reason='%s'",
+          feedback.action.c_str(),
+          feedback.argument.c_str(),
+          feedback.worker_result.c_str(),
+          feedback.approved ? "true" : "false",
+          static_cast<unsigned int>(feedback.status),
+          feedback.failure_reason.c_str()
         );
 
-        if (action == "Check" && result == "failure")
+        if (isCheckAction(feedback.action) && !feedback.approved)
         {
           RCLCPP_WARN(
             this->get_logger(),
-            "SM_WAIT_EXECUTION_RESULT: Check failure -> retry current instruction"
+            "SM_WAIT_EXECUTION_RESULT: Check rejected (%s) -> retry current instruction",
+            feedback.failure_reason.c_str()
           );
           publishRetryCommand();
         }
 
-        if (result == "success" || result == "failure")
+        if (
+          feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS ||
+          feedback.status == supervisor_interfaces::msg::TaskExecutionReport::FAILURE ||
+          feedback.status == supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT ||
+          feedback.status == supervisor_interfaces::msg::TaskExecutionReport::REJECTED)
         {
           bool active_plan = false;
           if (getPlanActiveStatus(active_plan))
@@ -375,8 +372,8 @@ private:
 
         RCLCPP_WARN(
           this->get_logger(),
-          "SM_WAIT_EXECUTION_RESULT: result='%s' not actionable",
-          result.c_str()
+          "SM_WAIT_EXECUTION_RESULT: status='%u' not actionable",
+          static_cast<unsigned int>(feedback.status)
         );
         publishAllowNextCycle();
         break;
@@ -393,16 +390,14 @@ private:
 
   // ===== ROS =====
   rclcpp::Subscription<supervisor_interfaces::msg::SystemStatus>::SharedPtr sub_status_;
-  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr execution_feedback_sub_;
+  rclcpp::Subscription<supervisor_interfaces::msg::TaskExecutionReport>::SharedPtr
+    execution_feedback_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr plan_active_sub_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr plan_ready_sub_;
 
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_next_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_plan_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr instruction_cmd_pub_;
-
-  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr start_planning_client_;
-  std::shared_future<std::shared_ptr<std_srvs::srv::Trigger::Response>> start_planning_future_;
-  bool start_planning_sent_{false};
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
@@ -418,10 +413,11 @@ private:
   std::optional<supervisor_interfaces::msg::SystemStatus> last_status_;
   bool got_status_{false};
 
-  std::optional<std::string> last_execution_feedback_;
+  std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
   bool plan_active_{false};
   bool got_plan_active_{false};
+  bool plan_ready_signal_{false};
 };
 
 int main(int argc, char ** argv)
