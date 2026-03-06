@@ -8,9 +8,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <planning_tools/Planning.hpp>
 
@@ -19,9 +21,15 @@ using namespace std::chrono_literals;
 class SupervisorManagerNode : public rclcpp::Node
 {
 public:
-  SupervisorManagerNode() : Node("supervisor_manager_node")
+  explicit SupervisorManagerNode(bool natural_language_planning)
+  : Node("supervisor_manager_node"),
+    natural_language_planning_(natural_language_planning)
   {
     RCLCPP_INFO(this->get_logger(), "supervisor_manager_node: started");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "natural_language_planning=%s",
+      natural_language_planning_ ? "true" : "false");
 
     // --- Subscribers ---
     sub_status_ = this->create_subscription<supervisor_interfaces::msg::SystemStatus>(
@@ -143,10 +151,6 @@ private:
   {
     allow_plan_instruction_pub_->publish(std_msgs::msg::Empty{});
     allow_next_instruction_pub_->publish(std_msgs::msg::Empty{});
-    RCLCPP_INFO(
-      this->get_logger(),
-      "Manager semaphore: allow one plan dispatch + allow execution trigger"
-    );
   }
 
   bool getPlanActiveStatus(bool & out)
@@ -182,17 +186,20 @@ private:
     instruction_cmd_pub_->publish(msg);
   }
 
-  bool isCheckAction(const std::string & action) const
-  {
-    std::string normalized = action;
-    std::transform(
-      normalized.begin(),
-      normalized.end(),
-      normalized.begin(),
-      [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+ bool needsApprovalRetry(const std::string & action) const
+{
+  std::string normalized = action;
+  std::transform(
+    normalized.begin(),
+    normalized.end(),
+    normalized.begin(),
+    [](unsigned char c) {return static_cast<char>(std::tolower(c));});
 
-    return normalized == "check" || normalized == "wait_for";
-  }
+  // Acciones cuyo resultado "approved=false" implica que debes reintentar la MISMA instrucción
+  return (normalized == "check" ||
+          normalized == "wait_for" ||
+          normalized == "listen");
+}
 
   // ===== FSM Tick =====
   void tick()
@@ -202,7 +209,7 @@ private:
       case State::SM_INIT:
       {
         RCLCPP_INFO(this->get_logger(), "SM_INIT: Init");
-        RCLCPP_INFO(this->get_logger(), "Waiting messages on /system/status ...");
+        RCLCPP_INFO(this->get_logger(), "SM_INIT: Waiting messages on /system/status ...");
         state_ = State::SM_VERIFY_SYS;
         break;
       }
@@ -240,41 +247,62 @@ private:
 
       case State::SM_CREATE_PLAN:
       {
-        RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: parsing semantic command");
-
-        const std::string cmd =
-          "Go to the entrance and wait for the door to be oppened and navigate to living room "
-          "and wait until you listen continue and navigate to the entrance";
-
-        std::string plan = planning_->parseSemanticCommand(cmd);
-
-        if (plan.empty())
+        if (natural_language_planning_)
         {
-          RCLCPP_ERROR(this->get_logger(), "SM_CREATE_PLAN: semantic parser returned empty plan -> back to VERIFY");
-          state_ = State::SM_VERIFY_SYS;
-          break;
-        }
+          RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: parsing semantic command");
 
-        RCLCPP_INFO(this->get_logger(), "Plan semantic parsed: %s", plan.c_str());
+          const std::string cmd =
+            "Go to the entrance and wait for the door to be oppened and navigate to living room "
+            "and wait until you listen continue and navigate to the entrance";
 
-        clearPlanReadySignal();
+          std::string plan = planning_->parseSemanticCommand(cmd);
 
-        const std::string primitive_result = planning_->primitiveToClips(plan);
-        if (primitive_result.empty())
-        {
-          RCLCPP_ERROR(
+          if (plan.empty())
+          {
+            RCLCPP_ERROR(this->get_logger(), "SM_CREATE_PLAN: semantic parser returned empty plan");
+            state_ = State::SM_VERIFY_SYS;
+            break;
+          }
+
+          RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: Plan semantic parsed: %s", plan.c_str());
+
+          clearPlanReadySignal();
+
+          const std::string primitive_result = planning_->primitiveToClips(plan);
+          if (primitive_result.empty())
+          {
+            RCLCPP_ERROR(
+              this->get_logger(),
+              "SM_CREATE_PLAN: primitive_to_clips failed"
+            );
+            state_ = State::SM_VERIFY_SYS;
+            break;
+          }
+
+          RCLCPP_INFO(
             this->get_logger(),
-            "SM_CREATE_PLAN: primitive_to_clips failed -> back to VERIFY"
+            "SM_CREATE_PLAN: Plan sent to CLIPS (primitive_to_clips): %s",
+            primitive_result.c_str()
           );
-          state_ = State::SM_VERIFY_SYS;
-          break;
         }
+        else
+        {
+          RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: starting planning directly (startPlanning)");
 
-        RCLCPP_INFO(
-          this->get_logger(),
-          "Plan sent to CLIPS (primitive_to_clips): %s",
-          primitive_result.c_str()
-        );
+          clearPlanReadySignal();
+
+          if (!planning_->startPlanning())
+          {
+            RCLCPP_ERROR(
+              this->get_logger(),
+              "SM_CREATE_PLAN: startPlanning failed -> back to VERIFY"
+            );
+            state_ = State::SM_VERIFY_SYS;
+            break;
+          }
+
+          RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: startPlanning request sent successfully");
+        }
 
         state_ = State::SM_WAIT_PLAN_READY;
         break;
@@ -301,10 +329,12 @@ private:
 
       case State::SM_POST_PLAN_TRIGGER:
       {
-        RCLCPP_INFO(
-          this->get_logger(),
-          "SM_POST_PLAN_TRIGGER: plan ready -> allow execution to request first instruction"
-        );
+        RCLCPP_INFO(this->get_logger(),
+                    "SM_POST_PLAN_TRIGGER: plan ready."
+                    );
+        RCLCPP_INFO(this->get_logger(),
+                    "SM_POST_PLAN_TRIGGER: Manager semaphore -> allow one plan dispatch + allow execution trigger"
+                    );
         publishAllowNextCycle();
         state_ = State::SM_WAIT_EXECUTION_RESULT;
         break;
@@ -325,7 +355,7 @@ private:
         RCLCPP_INFO(
           this->get_logger(),
           "SM_WAIT_EXECUTION_RESULT: feedback action='%s' arg='%s' worker='%s' approved=%s status=%u reason='%s'",
-          feedback.action.c_str(),
+          feedback.action.c_str(),  
           feedback.argument.c_str(),
           feedback.worker_result.c_str(),
           feedback.approved ? "true" : "false",
@@ -333,11 +363,12 @@ private:
           feedback.failure_reason.c_str()
         );
 
-        if (isCheckAction(feedback.action) && !feedback.approved)
+        if (needsApprovalRetry(feedback.action) && !feedback.approved)
         {
           RCLCPP_WARN(
             this->get_logger(),
-            "SM_WAIT_EXECUTION_RESULT: Check rejected (%s) -> retry current instruction",
+            "SM_WAIT_EXECUTION_RESULT: '%s' rejected (%s) -> retry current instruction",
+            feedback.action.c_str(),
             feedback.failure_reason.c_str()
           );
           publishRetryCommand();
@@ -365,7 +396,9 @@ private:
               "SM_WAIT_EXECUTION_RESULT: plan_active status not received yet"
             );
           }
-
+          RCLCPP_INFO(this->get_logger(),
+                    "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> allow one plan dispatch + allow execution trigger"
+                    );
           publishAllowNextCycle();
           break;
         }
@@ -375,6 +408,9 @@ private:
           "SM_WAIT_EXECUTION_RESULT: status='%u' not actionable",
           static_cast<unsigned int>(feedback.status)
         );
+        RCLCPP_INFO(this->get_logger(),
+                    "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> allow one plan dispatch + allow execution trigger"
+                    );
         publishAllowNextCycle();
         break;
       }
@@ -404,6 +440,7 @@ private:
 
   // Planning tool
   std::shared_ptr<Planning> planning_;
+  bool natural_language_planning_{false};
 
   // FSM
   State state_{State::SM_INIT};
@@ -420,11 +457,84 @@ private:
   bool plan_ready_signal_{false};
 };
 
+namespace
+{
+bool parseBooleanValue(const std::string & value, bool & out)
+{
+  std::string normalized = value;
+  std::transform(
+    normalized.begin(),
+    normalized.end(),
+    normalized.begin(),
+    [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+
+  if (normalized == "true" || normalized == "1" || normalized == "yes" || normalized == "on") {
+    out = true;
+    return true;
+  }
+
+  if (normalized == "false" || normalized == "0" || normalized == "no" || normalized == "off") {
+    out = false;
+    return true;
+  }
+
+  return false;
+}
+
+bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
+{
+  bool value = false;
+  bool found = false;
+
+  for (int i = 1; i < argc; ++i)
+  {
+    const std::string arg(argv[i]);
+    const std::string key = "natural_language_planning";
+
+    // Supports: natural_language_planning=true or natural_language_planning:=true
+    if (arg.rfind(key + "=", 0) == 0 || arg.rfind(key + ":=", 0) == 0)
+    {
+      const std::size_t delim_pos = arg.find('=');
+      bool parsed = false;
+      if (delim_pos != std::string::npos && delim_pos + 1 < arg.size()) {
+        parsed = parseBooleanValue(arg.substr(delim_pos + 1), value);
+      }
+      if (!parsed) {
+        RCLCPP_WARN(
+          rclcpp::get_logger("supervisor_manager_node"),
+          "Invalid value for natural_language_planning: '%s'. Using default false.",
+          arg.c_str());
+      } else {
+        found = true;
+      }
+      continue;
+    }
+
+    // Supports: natural_language_planning = true
+    if (arg == key && (i + 2) < argc && std::strcmp(argv[i + 1], "=") == 0)
+    {
+      if (!parseBooleanValue(argv[i + 2], value)) {
+        RCLCPP_WARN(
+          rclcpp::get_logger("supervisor_manager_node"),
+          "Invalid value for natural_language_planning: '%s'. Using default false.",
+          argv[i + 2]);
+      } else {
+        found = true;
+      }
+      i += 2;
+    }
+  }
+
+  return found ? value : false;
+}
+}  // namespace
+
 int main(int argc, char ** argv)
 {
+  const bool natural_language_planning = getNaturalLanguagePlanningFromArgv(argc, argv);
   rclcpp::init(argc, argv);
 
-  auto node = std::make_shared<SupervisorManagerNode>();
+  auto node = std::make_shared<SupervisorManagerNode>(natural_language_planning);
 
   rclcpp::executors::MultiThreadedExecutor exec(
     rclcpp::ExecutorOptions(),
