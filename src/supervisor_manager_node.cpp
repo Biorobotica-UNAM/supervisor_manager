@@ -70,8 +70,15 @@ public:
     instruction_cmd_pub_ = this->create_publisher<std_msgs::msg::Int32>(
       "/supervisor/supervisor_manager/instruction_command", 10);
 
-    talker_client_ = this->create_client<talker_interfaces::srv::Talk>("/hri/talker/talk");
-    listener_client_ = this->create_client<listener_interfaces::srv::Listen>("/hri/listener/listen");
+    hri_client_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    talker_client_ = this->create_client<talker_interfaces::srv::Talk>(
+      "/hri/talker/talk",
+      rmw_qos_profile_services_default,
+      hri_client_group_);
+    listener_client_ = this->create_client<listener_interfaces::srv::Listen>(
+      "/hri/listener/listen",
+      rmw_qos_profile_services_default,
+      hri_client_group_);
 
     // --- FSM Timer (10 Hz) ---
     timer_ = this->create_wall_timer(
@@ -593,6 +600,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_next_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_plan_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr instruction_cmd_pub_;
+  rclcpp::CallbackGroup::SharedPtr hri_client_group_;
   rclcpp::Client<talker_interfaces::srv::Talk>::SharedPtr talker_client_;
   rclcpp::Client<listener_interfaces::srv::Listen>::SharedPtr listener_client_;
 
