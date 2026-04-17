@@ -6,6 +6,7 @@
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/bool.hpp>
 
+#include <known_locations_interfaces/srv/locations_get.hpp>
 #include <listener_interfaces/srv/listen.hpp>
 #include <talker_interfaces/srv/talk.hpp>
 #include <planning_tools/Planning.hpp>
@@ -79,6 +80,10 @@ public:
       "/hri/listener/listen",
       rmw_qos_profile_services_default,
       hri_client_group_);
+    goto_client_ = this->create_client<known_locations_interfaces::srv::LocationsGet>(
+      "/nav_controller/go_to_location",
+      rmw_qos_profile_services_default,
+      hri_client_group_);
 
     // --- FSM Timer (10 Hz) ---
     timer_ = this->create_wall_timer(
@@ -117,6 +122,61 @@ private:
   }
 
   // ===== Pipeline helpers =====
+  bool goToLocation(const std::string & location_name)
+  {
+    if (!goto_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Goto] GoTo client not initialized");
+      return false;
+    }
+
+    if (!goto_client_->wait_for_service(500ms)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Goto] Service /nav_controller/go_to_location unavailable"
+      );
+      return false;
+    }
+
+    auto request = std::make_shared<known_locations_interfaces::srv::LocationsGet::Request>();
+    request->location_name = location_name;
+
+    auto future = goto_client_->async_send_request(request);
+    const auto status = future.wait_for(120s);
+    if (status != std::future_status::ready) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Goto] Timeout waiting for '%s'",
+        location_name.c_str()
+      );
+      return false;
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Goto] Navigation to '%s' failed: %s",
+        location_name.c_str(),
+        response->message.c_str()
+      );
+      return false;
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Goto] Arrived at '%s': %s",
+      location_name.c_str(),
+      response->message.c_str()
+    );
+    return true;
+  }
+
+  bool goToInstructionPoint()
+  {
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step -1] Navigating to instruction_point...");
+    return goToLocation("instruction_point");
+  }
+
   bool sayText(const std::string & text)
   {
     if (!talker_client_) {
@@ -239,6 +299,11 @@ private:
 
     RCLCPP_INFO(this->get_logger(), "──────────────────────────────────────");
     RCLCPP_INFO(this->get_logger(), "Natural language pipeline started");
+
+    if (!goToInstructionPoint()) {
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step -1: goToInstructionPoint failed");
+      return false;
+    }
 
     if (!promptForCommand()) {
       RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: promptForCommand failed");
@@ -601,6 +666,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_plan_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr instruction_cmd_pub_;
   rclcpp::CallbackGroup::SharedPtr hri_client_group_;
+  rclcpp::Client<known_locations_interfaces::srv::LocationsGet>::SharedPtr goto_client_;
   rclcpp::Client<talker_interfaces::srv::Talk>::SharedPtr talker_client_;
   rclcpp::Client<listener_interfaces::srv::Listen>::SharedPtr listener_client_;
 

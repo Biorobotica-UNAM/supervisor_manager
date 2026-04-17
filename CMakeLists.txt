@@ -14,6 +14,7 @@ find_package(std_srvs REQUIRED)
 find_package(supervisor_interfaces REQUIRED)
 find_package(planning_tools REQUIRED)
 find_package(clips_interfaces REQUIRED)
+find_package(known_locations_interfaces REQUIRED)
 find_package(listener_interfaces REQUIRED)
 find_package(talker_interfaces REQUIRED)
 
@@ -38,6 +39,7 @@ ament_target_dependencies(supervisor_manager_node
   supervisor_interfaces
   clips_interfaces
   planning_tools
+  known_locations_interfaces
   listener_interfaces
   talker_interfaces
 )
@@ -60,6 +62,7 @@ ament_export_dependencies(
   supervisor_interfaces
   clips_interfaces
   planning_tools
+  known_locations_interfaces
   listener_interfaces
   talker_interfaces
 )
