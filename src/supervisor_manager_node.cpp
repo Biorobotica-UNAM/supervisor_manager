@@ -6,12 +6,15 @@
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/bool.hpp>
 
+#include <listener_interfaces/srv/listen.hpp>
+#include <talker_interfaces/srv/talk.hpp>
 #include <planning_tools/Planning.hpp>
-#include <hri_tools/HRI.hpp>
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -67,6 +70,9 @@ public:
     instruction_cmd_pub_ = this->create_publisher<std_msgs::msg::Int32>(
       "/supervisor/supervisor_manager/instruction_command", 10);
 
+    talker_client_ = this->create_client<talker_interfaces::srv::Talk>("/hri/talker/talk");
+    listener_client_ = this->create_client<listener_interfaces::srv::Listen>("/hri/listener/listen");
+
     // --- FSM Timer (10 Hz) ---
     timer_ = this->create_wall_timer(
       100ms,
@@ -99,16 +105,84 @@ private:
 
     auto node_ptr = this->shared_from_this();
     planning_ = std::make_shared<Planning>(node_ptr);
-    hri_ = std::make_shared<HRI>(node_ptr);
 
-    RCLCPP_INFO(this->get_logger(), "Planning and HRI tools initialized");
+    RCLCPP_INFO(this->get_logger(), "Planning tool initialized");
   }
 
   // ===== Pipeline helpers =====
+  bool sayText(const std::string & text)
+  {
+    if (!talker_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Say] Talk client not initialized");
+      return false;
+    }
+
+    if (!talker_client_->wait_for_service(1s)) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Say] Talk service unavailable");
+      return false;
+    }
+
+    auto request = std::make_shared<talker_interfaces::srv::Talk::Request>();
+    request->text = text;
+
+    auto future = talker_client_->async_send_request(request);
+    const auto status = future.wait_for(10s);
+    if (status != std::future_status::ready) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Say] Talk service timed out");
+      return false;
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[Pipeline][Say] TTS error: %s",
+        response->message.c_str()
+      );
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Say] TTS OK: %s", response->message.c_str());
+    return true;
+  }
+
+  bool promptForCommand()
+  {
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 0] Prompting user for a command...");
+    return sayText("Please tell me your command.");
+  }
+
   std::string stepListen()
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 1] Listening...");
-    const std::string text = hri_->Listen("");
+    if (!listener_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen client not initialized");
+      return "";
+    }
+
+    if (!listener_client_->wait_for_service(1s)) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen service unavailable");
+      return "";
+    }
+
+    auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
+    request->enable = true;
+    request->grammar = "";
+
+    auto future = listener_client_->async_send_request(request);
+    const auto status = future.wait_for(10s);
+    if (status != std::future_status::ready) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen timeout");
+      return "";
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen failed");
+      return "";
+    }
+
+    const std::string text = response->recognized_speech;
 
     if (text.empty()) {
       RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen returned empty");
@@ -149,15 +223,20 @@ private:
 
   bool runNaturalLanguagePipeline()
   {
-    if (!hri_ || !planning_) {
+    if (!planning_) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "runNaturalLanguagePipeline: tools not initialized yet");
+        "runNaturalLanguagePipeline: planning tool not initialized yet");
       return false;
     }
 
     RCLCPP_INFO(this->get_logger(), "──────────────────────────────────────");
     RCLCPP_INFO(this->get_logger(), "Natural language pipeline started");
+
+    if (!promptForCommand()) {
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: promptForCommand failed");
+      return false;
+    }
 
     const std::string text = stepListen();
     if (text.empty()) {
@@ -345,13 +424,6 @@ private:
         {
           RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: running natural language pipeline");
 
-          if (!hri_) {
-            RCLCPP_WARN_THROTTLE(
-              this->get_logger(), *this->get_clock(), 2000,
-              "SM_CREATE_PLAN: HRI tool not initialized yet");
-            break;
-          }
-
           if (!runNaturalLanguagePipeline())
           {
             RCLCPP_ERROR(
@@ -521,13 +593,14 @@ private:
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_next_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_plan_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr instruction_cmd_pub_;
+  rclcpp::Client<talker_interfaces::srv::Talk>::SharedPtr talker_client_;
+  rclcpp::Client<listener_interfaces::srv::Listen>::SharedPtr listener_client_;
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
 
   // Tools
   std::shared_ptr<Planning> planning_;
-  std::shared_ptr<HRI> hri_;
   bool natural_language_planning_{false};
 
   // FSM
