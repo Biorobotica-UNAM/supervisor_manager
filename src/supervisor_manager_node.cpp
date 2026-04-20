@@ -300,6 +300,8 @@ private:
     RCLCPP_INFO(this->get_logger(), "──────────────────────────────────────");
     RCLCPP_INFO(this->get_logger(), "Natural language pipeline started");
 
+    sayText("Im ready for GPSR task, ill navigate to the intruction point, please open the door.");
+
     if (!goToInstructionPoint()) {
       RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step -1: goToInstructionPoint failed");
       return false;
