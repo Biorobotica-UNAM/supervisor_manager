@@ -6,15 +6,21 @@
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/bool.hpp>
 
+#include <known_locations_interfaces/srv/locations_get.hpp>
+#include <listener_interfaces/srv/listen.hpp>
+#include <talker_interfaces/srv/talk.hpp>
+#include <planning_tools/Planning.hpp>
+
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <planning_tools/Planning.hpp>
 
 using namespace std::chrono_literals;
 
@@ -44,11 +50,13 @@ public:
       rclcpp::QoS(10),
       std::bind(&SupervisorManagerNode::executionFeedbackCallback, this, std::placeholders::_1)
     );
+
     plan_active_sub_ = this->create_subscription<std_msgs::msg::Bool>(
       "/supervisor/supervisor_plan/active",
       rclcpp::QoS(10),
       std::bind(&SupervisorManagerNode::planActiveCallback, this, std::placeholders::_1)
     );
+
     plan_ready_sub_ = this->create_subscription<std_msgs::msg::Empty>(
       "/supervisor/supervisor_plan/plan_ready",
       rclcpp::QoS(10),
@@ -63,16 +71,30 @@ public:
     instruction_cmd_pub_ = this->create_publisher<std_msgs::msg::Int32>(
       "/supervisor/supervisor_manager/instruction_command", 10);
 
+    hri_client_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    talker_client_ = this->create_client<talker_interfaces::srv::Talk>(
+      "/hri/talker/talk",
+      rmw_qos_profile_services_default,
+      hri_client_group_);
+    listener_client_ = this->create_client<listener_interfaces::srv::Listen>(
+      "/hri/listener/listen",
+      rmw_qos_profile_services_default,
+      hri_client_group_);
+    goto_client_ = this->create_client<known_locations_interfaces::srv::LocationsGet>(
+      "/nav_controller/go_to_location",
+      rmw_qos_profile_services_default,
+      hri_client_group_);
+
     // --- FSM Timer (10 Hz) ---
     timer_ = this->create_wall_timer(
       100ms,
       std::bind(&SupervisorManagerNode::tick, this)
     );
 
-    // --- One-shot init for Planning tool ---
+    // --- One-shot init for tools needing shared_from_this() ---
     init_timer_ = this->create_wall_timer(
       0ms,
-      std::bind(&SupervisorManagerNode::initPlanningOnce, this)
+      std::bind(&SupervisorManagerNode::initToolsOnce, this)
     );
   }
 
@@ -82,18 +104,237 @@ private:
     SM_INIT,
     SM_VERIFY_SYS,
 
-    SM_CREATE_PLAN,          // parse + primitiveToClips
-    SM_WAIT_PLAN_READY,      // wait notification from supervisor_plan
-    SM_POST_PLAN_TRIGGER,      // allow execution to request first instruction
-    SM_WAIT_EXECUTION_RESULT   // manager waits execution feedback and decides next move
+    SM_CREATE_PLAN,
+    SM_WAIT_PLAN_READY,
+    SM_POST_PLAN_TRIGGER,
+    SM_WAIT_EXECUTION_RESULT
   };
 
   // ===== One-shot init =====
-  void initPlanningOnce()
+  void initToolsOnce()
   {
     init_timer_->cancel();
-    planning_ = std::make_shared<Planning>(this->shared_from_this());
+
+    auto node_ptr = this->shared_from_this();
+    planning_ = std::make_shared<Planning>(node_ptr);
+
     RCLCPP_INFO(this->get_logger(), "Planning tool initialized");
+  }
+
+  // ===== Pipeline helpers =====
+  bool goToLocation(const std::string & location_name)
+  {
+    if (!goto_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Goto] GoTo client not initialized");
+      return false;
+    }
+
+    if (!goto_client_->wait_for_service(500ms)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Goto] Service /nav_controller/go_to_location unavailable"
+      );
+      return false;
+    }
+
+    auto request = std::make_shared<known_locations_interfaces::srv::LocationsGet::Request>();
+    request->location_name = location_name;
+
+    auto future = goto_client_->async_send_request(request);
+    const auto status = future.wait_for(120s);
+    if (status != std::future_status::ready) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Goto] Timeout waiting for '%s'",
+        location_name.c_str()
+      );
+      return false;
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Goto] Navigation to '%s' failed: %s",
+        location_name.c_str(),
+        response->message.c_str()
+      );
+      return false;
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Goto] Arrived at '%s': %s",
+      location_name.c_str(),
+      response->message.c_str()
+    );
+    return true;
+  }
+
+  bool goToInstructionPoint()
+  {
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step -1] Navigating to instruction_point...");
+    return goToLocation("instruction_point");
+  }
+
+  bool sayText(const std::string & text)
+  {
+    if (!talker_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Say] Talk client not initialized");
+      return false;
+    }
+
+    if (!talker_client_->wait_for_service(1s)) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Say] Talk service unavailable");
+      return false;
+    }
+
+    auto request = std::make_shared<talker_interfaces::srv::Talk::Request>();
+    request->text = text;
+
+    auto future = talker_client_->async_send_request(request);
+    const auto status = future.wait_for(10s);
+    if (status != std::future_status::ready) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Say] Talk service timed out");
+      return false;
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[Pipeline][Say] TTS error: %s",
+        response->message.c_str()
+      );
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Say] TTS OK: %s", response->message.c_str());
+    return true;
+  }
+
+  bool promptForCommand()
+  {
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 0] Prompting user for a command...");
+    return sayText("Please tell me your command.");
+  }
+
+  std::string stepListen()
+  {
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 1] Listening...");
+    if (!listener_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen client not initialized");
+      return "";
+    }
+
+    if (!listener_client_->wait_for_service(1s)) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen service unavailable");
+      return "";
+    }
+
+    auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
+    request->enable = true;
+    request->grammar = "";
+
+    auto future = listener_client_->async_send_request(request);
+    const auto status = future.wait_for(10s);
+    if (status != std::future_status::ready) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen timeout");
+      return "";
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen failed");
+      return "";
+    }
+
+    const std::string text = response->recognized_speech;
+
+    if (text.empty()) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen returned empty");
+      return "";
+    }
+
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 1] Recognised: \"%s\"", text.c_str());
+    return text;
+  }
+
+  std::string stepParse(const std::string & text)
+  {
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 2] Parsing: \"%s\"", text.c_str());
+    const std::string semantic = planning_->parseSemanticCommand(text);
+
+    if (semantic.empty()) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 2] Semantic parser returned empty");
+      return "";
+    }
+
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 2] Semantic CD: \"%s\"", semantic.c_str());
+    return semantic;
+  }
+
+  std::string stepToClips(const std::string & semantic)
+  {
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] Converting to CLIPS: \"%s\"", semantic.c_str());
+    const std::string clips = planning_->primitiveToClips(semantic);
+
+    if (clips.empty()) {
+      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 3] primitiveToClips returned empty");
+      return "";
+    }
+
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] CLIPS facts: \"%s\"", clips.c_str());
+    return clips;
+  }
+
+  bool runNaturalLanguagePipeline()
+  {
+    if (!planning_) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "runNaturalLanguagePipeline: planning tool not initialized yet");
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "──────────────────────────────────────");
+    RCLCPP_INFO(this->get_logger(), "Natural language pipeline started");
+
+    sayText("Im ready for GPSR task, ill navigate to the intruction point, please open the door.");
+
+    if (!goToInstructionPoint()) {
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step -1: goToInstructionPoint failed");
+      return false;
+    }
+
+    if (!promptForCommand()) {
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: promptForCommand failed");
+      return false;
+    }
+
+    const std::string text = stepListen();
+    if (text.empty()) {
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 1: Listen returned empty");
+      return false;
+    }
+
+    const std::string semantic = stepParse(text);
+    if (semantic.empty()) {
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 2: parseSemanticCommand returned empty");
+      return false;
+    }
+
+    clearPlanReadySignal();
+
+    const std::string clips = stepToClips(semantic);
+    if (clips.empty()) {
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 3: primitiveToClips returned empty");
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Natural language pipeline completed successfully");
+    RCLCPP_INFO(this->get_logger(), "──────────────────────────────────────");
+    return true;
   }
 
   // ===== Callbacks =====
@@ -186,20 +427,19 @@ private:
     instruction_cmd_pub_->publish(msg);
   }
 
- bool needsApprovalRetry(const std::string & action) const
-{
-  std::string normalized = action;
-  std::transform(
-    normalized.begin(),
-    normalized.end(),
-    normalized.begin(),
-    [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+  bool needsApprovalRetry(const std::string & action) const
+  {
+    std::string normalized = action;
+    std::transform(
+      normalized.begin(),
+      normalized.end(),
+      normalized.begin(),
+      [](unsigned char c) {return static_cast<char>(std::tolower(c));});
 
-  // Acciones cuyo resultado "approved=false" implica que debes reintentar la MISMA instrucción
-  return (normalized == "check" ||
-          normalized == "wait_for" ||
-          normalized == "listen");
-}
+    return (normalized == "check" ||
+            normalized == "wait_for" ||
+            normalized == "listen");
+  }
 
   // ===== FSM Tick =====
   void tick()
@@ -247,43 +487,26 @@ private:
 
       case State::SM_CREATE_PLAN:
       {
+        if (!planning_) {
+          RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "SM_CREATE_PLAN: Planning tool not initialized yet");
+          break;
+        }
+
         if (natural_language_planning_)
         {
-          RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: parsing semantic command");
+          RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: running natural language pipeline");
 
-          const std::string cmd =
-            "Go to the entrance and wait for the door to be oppened and navigate to living room "
-            "and wait until you listen continue and navigate to the entrance";
-
-          std::string plan = planning_->parseSemanticCommand(cmd);
-
-          if (plan.empty())
-          {
-            RCLCPP_ERROR(this->get_logger(), "SM_CREATE_PLAN: semantic parser returned empty plan");
-            state_ = State::SM_VERIFY_SYS;
-            break;
-          }
-
-          RCLCPP_INFO(this->get_logger(), "SM_CREATE_PLAN: Plan semantic parsed: %s", plan.c_str());
-
-          clearPlanReadySignal();
-
-          const std::string primitive_result = planning_->primitiveToClips(plan);
-          if (primitive_result.empty())
+          if (!runNaturalLanguagePipeline())
           {
             RCLCPP_ERROR(
               this->get_logger(),
-              "SM_CREATE_PLAN: primitive_to_clips failed"
+              "SM_CREATE_PLAN: natural language pipeline failed -> back to VERIFY"
             );
             state_ = State::SM_VERIFY_SYS;
             break;
           }
-
-          RCLCPP_INFO(
-            this->get_logger(),
-            "SM_CREATE_PLAN: Plan sent to CLIPS (primitive_to_clips): %s",
-            primitive_result.c_str()
-          );
         }
         else
         {
@@ -330,11 +553,9 @@ private:
       case State::SM_POST_PLAN_TRIGGER:
       {
         RCLCPP_INFO(this->get_logger(),
-                    "SM_POST_PLAN_TRIGGER: plan ready."
-                    );
+                    "SM_POST_PLAN_TRIGGER: plan ready.");
         RCLCPP_INFO(this->get_logger(),
-                    "SM_POST_PLAN_TRIGGER: Manager semaphore -> allow one plan dispatch + allow execution trigger"
-                    );
+                    "SM_POST_PLAN_TRIGGER: Manager semaphore -> allow one plan dispatch + allow execution trigger");
         publishAllowNextCycle();
         state_ = State::SM_WAIT_EXECUTION_RESULT;
         break;
@@ -355,7 +576,7 @@ private:
         RCLCPP_INFO(
           this->get_logger(),
           "SM_WAIT_EXECUTION_RESULT: feedback action='%s' arg='%s' worker='%s' approved=%s status=%u reason='%s'",
-          feedback.action.c_str(),  
+          feedback.action.c_str(),
           feedback.argument.c_str(),
           feedback.worker_result.c_str(),
           feedback.approved ? "true" : "false",
@@ -385,20 +606,33 @@ private:
           {
             RCLCPP_INFO(
               this->get_logger(),
-              "SM_WAIT_EXECUTION_RESULT: plan_active=%s before next cycle",
+              "SM_WAIT_EXECUTION_RESULT: plan_active=%s before next decision",
               active_plan ? "true" : "false"
             );
+
+            // Si ya no hay plan activo, reinicia el ciclo completo
+            // para volver a pedir una nueva tarea/instrucción.
+            if (!active_plan)
+            {
+              RCLCPP_INFO(
+                this->get_logger(),
+                "SM_WAIT_EXECUTION_RESULT: plan finished -> restarting task request pipeline"
+              );
+              state_ = State::SM_CREATE_PLAN;
+              break;
+            }
           }
           else
           {
             RCLCPP_WARN(
               this->get_logger(),
-              "SM_WAIT_EXECUTION_RESULT: plan_active status not received yet"
+              "SM_WAIT_EXECUTION_RESULT: plan_active status not received yet; waiting before dispatching next cycle"
             );
+            break;
           }
+
           RCLCPP_INFO(this->get_logger(),
-                    "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> allow one plan dispatch + allow execution trigger"
-                    );
+                      "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> allow one plan dispatch + allow execution trigger");
           publishAllowNextCycle();
           break;
         }
@@ -409,8 +643,7 @@ private:
           static_cast<unsigned int>(feedback.status)
         );
         RCLCPP_INFO(this->get_logger(),
-                    "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> allow one plan dispatch + allow execution trigger"
-                    );
+                    "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> allow one plan dispatch + allow execution trigger");
         publishAllowNextCycle();
         break;
       }
@@ -434,11 +667,15 @@ private:
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_next_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_plan_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr instruction_cmd_pub_;
+  rclcpp::CallbackGroup::SharedPtr hri_client_group_;
+  rclcpp::Client<known_locations_interfaces::srv::LocationsGet>::SharedPtr goto_client_;
+  rclcpp::Client<talker_interfaces::srv::Talk>::SharedPtr talker_client_;
+  rclcpp::Client<listener_interfaces::srv::Listen>::SharedPtr listener_client_;
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
 
-  // Planning tool
+  // Tools
   std::shared_ptr<Planning> planning_;
   bool natural_language_planning_{false};
 
@@ -452,6 +689,7 @@ private:
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
+
   bool plan_active_{false};
   bool got_plan_active_{false};
   bool plan_ready_signal_{false};
@@ -491,7 +729,6 @@ bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
     const std::string arg(argv[i]);
     const std::string key = "natural_language_planning";
 
-    // Supports: natural_language_planning=true or natural_language_planning:=true
     if (arg.rfind(key + "=", 0) == 0 || arg.rfind(key + ":=", 0) == 0)
     {
       const std::size_t delim_pos = arg.find('=');
@@ -510,7 +747,6 @@ bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
       continue;
     }
 
-    // Supports: natural_language_planning = true
     if (arg == key && (i + 2) < argc && std::strcmp(argv[i + 1], "=") == 0)
     {
       if (!parseBooleanValue(argv[i + 2], value)) {
