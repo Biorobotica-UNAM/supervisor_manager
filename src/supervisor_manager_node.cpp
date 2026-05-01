@@ -5,6 +5,7 @@
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <known_locations_interfaces/srv/locations_get.hpp>
 #include <listener_interfaces/srv/listen.hpp>
@@ -64,12 +65,16 @@ public:
     );
 
     // --- Publishers ---
+	rewind_pub_ = create_publisher<std_msgs::msg::Empty>("/supervisor/supervisor_plan/rewind_one", 10);
+
     allow_next_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
       "/supervisor/supervisor_manager/allow_next_instruction", 10);
     allow_plan_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
       "/supervisor/supervisor_manager/allow_plan_instruction", 10);
     instruction_cmd_pub_ = this->create_publisher<std_msgs::msg::Int32>(
       "/supervisor/supervisor_manager/instruction_command", 10);
+	corrective_instruction_pub_ = this->create_publisher<std_msgs::msg::String>(
+	  "/supervisor/supervisor_manager/instruction", 10);
 
     hri_client_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     talker_client_ = this->create_client<talker_interfaces::srv::Talk>(
@@ -441,6 +446,19 @@ private:
             normalized == "listen");
   }
 
+  // AGREGAR junto a needsApprovalRetry():
+  std::string getCorrectiveInstruction(
+    const std::string & action,
+    const std::string & argument) const
+  {
+    if (action == "listen" || action == "listen_for") {
+      if (argument == "name")     return "Justina say repeat_name";
+      if (argument == "drink")    return "Justina say repeat_drink";
+      return "say please_repeat";   // fallback genérico
+    }
+    return "";
+  }
+
   // ===== FSM Tick =====
   void tick()
   {
@@ -584,16 +602,29 @@ private:
           feedback.failure_reason.c_str()
         );
 
-        if (needsApprovalRetry(feedback.action) && !feedback.approved)
-        {
-          RCLCPP_WARN(
-            this->get_logger(),
-            "SM_WAIT_EXECUTION_RESULT: '%s' rejected (%s) -> retry current instruction",
-            feedback.action.c_str(),
-            feedback.failure_reason.c_str()
-          );
-          publishRetryCommand();
-        }
+        if (feedback.action != "listen") {
+			corrective_pending_ = false;
+		}
+
+        // En el bloque de retry:
+		if (needsApprovalRetry(feedback.action) && !feedback.approved)
+		{
+		  if (!corrective_pending_) {
+			  const std::string corrective =
+				getCorrectiveInstruction(feedback.action, feedback.argument);
+			  if (!corrective.empty()) {
+				// Rewind para que el listen se reintente después del say
+				rewind_pub_->publish(std_msgs::msg::Empty{});
+				
+				std_msgs::msg::String inj;
+				inj.data = corrective;
+				corrective_instruction_pub_->publish(inj);
+				corrective_pending_ = true;
+			  }
+			}
+			publishAllowNextCycle();
+			break;
+		}
 
         if (
           feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS ||
@@ -664,9 +695,11 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr plan_active_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr plan_ready_sub_;
 
+  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr rewind_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_next_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_plan_instruction_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr instruction_cmd_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr corrective_instruction_pub_;
   rclcpp::CallbackGroup::SharedPtr hri_client_group_;
   rclcpp::Client<known_locations_interfaces::srv::LocationsGet>::SharedPtr goto_client_;
   rclcpp::Client<talker_interfaces::srv::Talk>::SharedPtr talker_client_;
@@ -686,6 +719,7 @@ private:
   std::mutex mtx_;
   std::optional<supervisor_interfaces::msg::SystemStatus> last_status_;
   bool got_status_{false};
+  bool corrective_pending_ = false;
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
