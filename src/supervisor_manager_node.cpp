@@ -112,7 +112,9 @@ private:
     SM_CREATE_PLAN,
     SM_WAIT_PLAN_READY,
     SM_POST_PLAN_TRIGGER,
-    SM_WAIT_EXECUTION_RESULT
+    SM_WAIT_EXECUTION_RESULT,
+
+    SM_FINISH
   };
 
   // ===== One-shot init =====
@@ -649,6 +651,13 @@ private:
                 this->get_logger(),
                 "SM_WAIT_EXECUTION_RESULT: plan finished -> restarting task request pipeline"
               );
+
+              if(!natural_language_planning_)
+              {
+                state_ = State::SM_FINISH;
+                break;
+              }
+
               state_ = State::SM_CREATE_PLAN;
               break;
             }
@@ -678,6 +687,13 @@ private:
         publishAllowNextCycle();
         break;
       }
+
+      case State::SM_FINISH:
+      {
+        RCLCPP_INFO(this->get_logger(),
+                    "SM_FINISH: Test finished.");
+        rclcpp::shutdown();
+      } 
 
       default:
       {
