@@ -397,6 +397,10 @@ private:
 
   void publishAllowNextCycle()
   {
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      got_plan_active_ = false;
+    }
     allow_plan_instruction_pub_->publish(std_msgs::msg::Empty{});
     allow_next_instruction_pub_->publish(std_msgs::msg::Empty{});
   }
@@ -456,7 +460,7 @@ private:
     if (action == "listen" || action == "listen_for") {
       if (argument == "name")     return "Justina say repeat_name";
       if (argument == "drink")    return "Justina say repeat_drink";
-      return "say please_repeat";   // fallback genérico
+      return "Justina say please_repeat";   // fallback genérico
     }
     return "";
   }
@@ -628,11 +632,7 @@ private:
 			break;
 		}
 
-        if (
-          feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS ||
-          feedback.status == supervisor_interfaces::msg::TaskExecutionReport::FAILURE ||
-          feedback.status == supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT ||
-          feedback.status == supervisor_interfaces::msg::TaskExecutionReport::REJECTED)
+        if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
           bool active_plan = false;
           if (getPlanActiveStatus(active_plan))
@@ -673,6 +673,41 @@ private:
 
           RCLCPP_INFO(this->get_logger(),
                       "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> allow one plan dispatch + allow execution trigger");
+          publishAllowNextCycle();
+          break;
+        }
+
+        if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::FAILURE ||
+            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT ||
+            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::REJECTED)
+        {
+          const std::string status_name =
+            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::FAILURE ? "FAILURE" :
+            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT ? "TIMEOUT" :
+            "REJECTED";
+
+          const std::string reason = feedback.failure_reason.empty()
+            ? status_name
+            : status_name + " - " + feedback.failure_reason;
+
+          std::string corrective_instruction =
+            "Justina say action " + feedback.action + " failed because " + reason;
+
+          std_msgs::msg::String inj;
+          inj.data = corrective_instruction;
+          corrective_instruction_pub_->publish(inj);
+
+          RCLCPP_ERROR(
+            this->get_logger(),
+            "SM_WAIT_EXECUTION_RESULT: execution failed (status=%u), injected corrective say and continuing to next instruction",
+            static_cast<unsigned int>(feedback.status)
+          );
+          RCLCPP_INFO(
+            this->get_logger(),
+            "SM_WAIT_EXECUTION_RESULT: injected corrective instruction='%s'",
+            corrective_instruction.c_str()
+          );
+
           publishAllowNextCycle();
           break;
         }
