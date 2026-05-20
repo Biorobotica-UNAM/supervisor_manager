@@ -452,6 +452,88 @@ private:
             normalized == "listen");
   }
 
+  bool isExecutionFailureStatus(uint8_t status) const
+  {
+    return status == supervisor_interfaces::msg::TaskExecutionReport::FAILURE ||
+           status == supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT ||
+           status == supervisor_interfaces::msg::TaskExecutionReport::REJECTED;
+  }
+
+  std::string executionStatusName(uint8_t status) const
+  {
+    switch (status) {
+      case supervisor_interfaces::msg::TaskExecutionReport::SUCCESS:
+        return "SUCCESS";
+      case supervisor_interfaces::msg::TaskExecutionReport::FAILURE:
+        return "FAILURE";
+      case supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT:
+        return "TIMEOUT";
+      case supervisor_interfaces::msg::TaskExecutionReport::REJECTED:
+        return "REJECTED";
+      default:
+        return "UNKNOWN";
+    }
+  }
+
+  std::string makeSpeechFriendly(std::string text) const
+  {
+    std::replace(text.begin(), text.end(), '_', ' ');
+    return text;
+  }
+
+  std::string failureReasonForSpeech(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback,
+    const std::string & fallback_reason) const
+  {
+    if (feedback.worker_result.rfind("navigation_failed", 0) == 0) {
+      return makeSpeechFriendly(feedback.worker_result);
+    }
+
+    if (!feedback.failure_reason.empty() &&
+        feedback.failure_reason != supervisor_interfaces::msg::TaskExecutionReport::REASON_NONE)
+    {
+      return makeSpeechFriendly(feedback.failure_reason);
+    }
+
+    if (!feedback.worker_result.empty()) {
+      return makeSpeechFriendly(feedback.worker_result);
+    }
+
+    return makeSpeechFriendly(fallback_reason);
+  }
+
+  void announceFailureAndContinue(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback,
+    const std::string & reason)
+  {
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "SM_WAIT_EXECUTION_RESULT: action failed; announcing and continuing. action='%s' arg='%s' status=%s approved=%s reason='%s' worker='%s'",
+      feedback.action.c_str(),
+      feedback.argument.c_str(),
+      executionStatusName(feedback.status).c_str(),
+      feedback.approved ? "true" : "false",
+      reason.c_str(),
+      feedback.worker_result.c_str());
+
+    std::string spoken = "I could not complete action " + makeSpeechFriendly(feedback.action);
+    if (!feedback.argument.empty()) {
+      spoken += " " + makeSpeechFriendly(feedback.argument);
+    }
+    spoken += " because " + failureReasonForSpeech(feedback, reason) + ". I will continue with the next step.";
+
+    if (!sayText(spoken)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "SM_WAIT_EXECUTION_RESULT: could not announce failure through TTS");
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> skip failed step and allow next plan dispatch");
+    publishAllowNextCycle();
+  }
+
   // AGREGAR junto a needsApprovalRetry():
   std::string getCorrectiveInstruction(
     const std::string & action,
@@ -612,6 +694,28 @@ private:
 			corrective_pending_ = false;
 		}
 
+        if (!feedback.approved || isExecutionFailureStatus(feedback.status))
+        {
+          const std::string status_name = executionStatusName(feedback.status);
+          std::string reason;
+          if (!feedback.failure_reason.empty() &&
+              feedback.failure_reason != supervisor_interfaces::msg::TaskExecutionReport::REASON_NONE)
+          {
+            reason = status_name + " - " + feedback.failure_reason;
+          }
+          else if (!feedback.worker_result.empty())
+          {
+            reason = status_name + " - " + feedback.worker_result;
+          }
+          else
+          {
+            reason = status_name;
+          }
+
+          announceFailureAndContinue(feedback, reason);
+          break;
+        }
+
         // En el bloque de retry:
 		if (needsApprovalRetry(feedback.action) && !feedback.approved)
 		{
@@ -677,41 +781,6 @@ private:
           break;
         }
 
-        if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::FAILURE ||
-            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT ||
-            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::REJECTED)
-        {
-          const std::string status_name =
-            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::FAILURE ? "FAILURE" :
-            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT ? "TIMEOUT" :
-            "REJECTED";
-
-          const std::string reason = feedback.failure_reason.empty()
-            ? status_name
-            : status_name + " - " + feedback.failure_reason;
-
-          std::string corrective_instruction =
-            "Justina say action " + feedback.action + " failed because " + reason;
-
-          std_msgs::msg::String inj;
-          inj.data = corrective_instruction;
-          corrective_instruction_pub_->publish(inj);
-
-          RCLCPP_ERROR(
-            this->get_logger(),
-            "SM_WAIT_EXECUTION_RESULT: execution failed (status=%u), injected corrective say and continuing to next instruction",
-            static_cast<unsigned int>(feedback.status)
-          );
-          RCLCPP_INFO(
-            this->get_logger(),
-            "SM_WAIT_EXECUTION_RESULT: injected corrective instruction='%s'",
-            corrective_instruction.c_str()
-          );
-
-          publishAllowNextCycle();
-          break;
-        }
-
         RCLCPP_WARN(
           this->get_logger(),
           "SM_WAIT_EXECUTION_RESULT: status='%u' not actionable",
@@ -726,8 +795,9 @@ private:
       case State::SM_FINISH:
       {
         RCLCPP_INFO(this->get_logger(),
-                    "SM_FINISH: Test finished.");
+                    "SM_FINISH: Supervisor stopped. No further plan instructions will be dispatched.");
         rclcpp::shutdown();
+        break;
       } 
 
       default:
