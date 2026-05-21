@@ -459,6 +459,76 @@ private:
            status == supervisor_interfaces::msg::TaskExecutionReport::REJECTED;
   }
 
+  std::string normalizeText(std::string value) const
+  {
+    std::transform(
+      value.begin(),
+      value.end(),
+      value.begin(),
+      [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+    return value;
+  }
+
+  bool isDoorClosedCheckFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string reason = normalizeText(feedback.failure_reason);
+
+    // Only a real closed-door reading starts the human prompt and retry loop.
+    // check_service_failed and unsupported arguments fall through to the
+    // generic failure path and continue.
+    return (action == "check" || action == "wait_for") &&
+           reason == supervisor_interfaces::msg::TaskExecutionReport::REASON_DOOR_CLOSED;
+  }
+
+  void scheduleDoorCheckRetry()
+  {
+    // Give the human a short window to open the door before dispatching the
+    // same check instruction again.
+    door_retry_pending_ = true;
+    door_retry_time_ = this->now() + rclcpp::Duration::from_seconds(5.0);
+  }
+
+  void handleDoorClosedCheck(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "SM_WAIT_EXECUTION_RESULT: door is closed; requesting human assistance and retrying. worker='%s'",
+      feedback.worker_result.c_str());
+
+    if (door_open_request_count_ >= MAX_DOOR_OPEN_REQUESTS) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "SM_WAIT_EXECUTION_RESULT: door stayed closed after %d requests; continuing with next instruction",
+        MAX_DOOR_OPEN_REQUESTS);
+
+      sayText(
+        "The door is still closed, so I cannot continue through it. "
+        "I will move on to the next instruction.");
+
+      door_waiting_active_ = false;
+      door_retry_pending_ = false;
+      door_open_request_count_ = 0;
+      publishAllowNextCycle();
+      return;
+    }
+
+    const char * prompt = door_waiting_active_
+      ? "I am waiting for the door to be opened."
+      : "Please open the door so I can continue.";
+
+    sayText(prompt);
+
+    ++door_open_request_count_;
+
+    // Stay in the execution-result state; the timer will retry this check when
+    // door_retry_time_ is reached.
+    door_waiting_active_ = true;
+    scheduleDoorCheckRetry();
+  }
+
   std::string executionStatusName(uint8_t status) const
   {
     switch (status) {
@@ -669,6 +739,27 @@ private:
 
       case State::SM_WAIT_EXECUTION_RESULT:
       {
+        // Door retries are scheduled locally by the manager. No new planner step
+        // is requested until the same check succeeds.
+        if (door_retry_pending_)
+        {
+          if (this->now() < door_retry_time_)
+          {
+            RCLCPP_DEBUG_THROTTLE(
+              this->get_logger(), *this->get_clock(), 1000,
+              "SM_WAIT_EXECUTION_RESULT: waiting before retrying door check..."
+            );
+            break;
+          }
+
+          door_retry_pending_ = false;
+          // Ask supervisor_plan to resend the last instruction, then allow one
+          // execution cycle through the existing semaphore path.
+          publishRetryCommand();
+          publishAllowNextCycle();
+          break;
+        }
+
         supervisor_interfaces::msg::TaskExecutionReport feedback;
         if (!consumeExecutionFeedback(feedback))
         {
@@ -693,6 +784,14 @@ private:
         if (feedback.action != "listen") {
 			corrective_pending_ = false;
 		}
+
+        if (isDoorClosedCheckFailure(feedback))
+        {
+          // Closed door is recoverable by human intervention, so do not announce
+          // it as a generic failure and do not advance to the next plan step yet.
+          handleDoorClosedCheck(feedback);
+          break;
+        }
 
         if (!feedback.approved || isExecutionFailureStatus(feedback.status))
         {
@@ -738,6 +837,11 @@ private:
 
         if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
+          // Any successful execution clears a pending door-wait episode.
+          door_waiting_active_ = false;
+          door_retry_pending_ = false;
+          door_open_request_count_ = 0;
+
           bool active_plan = false;
           if (getPlanActiveStatus(active_plan))
           {
@@ -841,6 +945,11 @@ private:
   std::optional<supervisor_interfaces::msg::SystemStatus> last_status_;
   bool got_status_{false};
   bool corrective_pending_ = false;
+  static constexpr int MAX_DOOR_OPEN_REQUESTS = 3;
+  bool door_waiting_active_{false};
+  bool door_retry_pending_{false};
+  int door_open_request_count_{0};
+  rclcpp::Time door_retry_time_{0, 0, RCL_ROS_TIME};
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
