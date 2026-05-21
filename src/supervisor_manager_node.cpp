@@ -401,8 +401,32 @@ private:
       std::lock_guard<std::mutex> lock(mtx_);
       got_plan_active_ = false;
     }
+
+    // Give supervisor_plan its dispatch token before triggering executor_manager
+    // to request the next instruction. Publishing both topics back-to-back can
+    // race: execution may call /request_instruction before the plan node has
+    // processed allow_plan_instruction.
     allow_plan_instruction_pub_->publish(std_msgs::msg::Empty{});
-    allow_next_instruction_pub_->publish(std_msgs::msg::Empty{});
+    scheduleExecutionTrigger();
+  }
+
+  void scheduleExecutionTrigger()
+  {
+    if (execution_trigger_timer_) {
+      execution_trigger_timer_->cancel();
+      execution_trigger_timer_.reset();
+    }
+
+    execution_trigger_timer_ = this->create_wall_timer(
+      50ms,
+      [this]()
+      {
+        allow_next_instruction_pub_->publish(std_msgs::msg::Empty{});
+        if (execution_trigger_timer_) {
+          execution_trigger_timer_->cancel();
+          execution_trigger_timer_.reset();
+        }
+      });
   }
 
   bool getPlanActiveStatus(bool & out)
@@ -932,6 +956,7 @@ private:
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
+  rclcpp::TimerBase::SharedPtr execution_trigger_timer_;
 
   // Tools
   std::shared_ptr<Planning> planning_;
