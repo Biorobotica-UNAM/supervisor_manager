@@ -506,6 +506,17 @@ private:
            reason == supervisor_interfaces::msg::TaskExecutionReport::REASON_DOOR_CLOSED;
   }
 
+  bool isDoorOpenCheckSuccess(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string worker_result = normalizeText(feedback.worker_result);
+
+    return (action == "check" || action == "wait_for") &&
+           feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS &&
+           worker_result.rfind("door_open", 0U) == 0U;
+  }
+
   void scheduleDoorCheckRetry()
   {
     // Give the human a short window to open the door before dispatching the
@@ -861,6 +872,10 @@ private:
 
         if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
+          if (door_waiting_active_ && isDoorOpenCheckSuccess(feedback)) {
+            sayText("I detected that the door is open. Thank you.");
+          }
+
           // Any successful execution clears a pending door-wait episode.
           door_waiting_active_ = false;
           door_retry_pending_ = false;
