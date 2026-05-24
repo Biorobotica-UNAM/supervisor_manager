@@ -64,6 +64,12 @@ public:
       std::bind(&SupervisorManagerNode::planReadyCallback, this, std::placeholders::_1)
     );
 
+    current_instruction_sub_ = this->create_subscription<std_msgs::msg::String>(
+      "/instruction_msg",
+      rclcpp::QoS(10),
+      std::bind(&SupervisorManagerNode::currentInstructionCallback, this, std::placeholders::_1)
+    );
+
     // --- Publishers ---
 	rewind_pub_ = create_publisher<std_msgs::msg::Empty>("/supervisor/supervisor_plan/rewind_one", 10);
 
@@ -374,6 +380,20 @@ private:
     plan_ready_signal_ = true;
   }
 
+  void currentInstructionCallback(const std_msgs::msg::String::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    current_instruction_ = msg->data;
+    got_current_instruction_ = true;
+
+    // /instruction_msg is published by supervisor_plan exactly when the next
+    // raw instruction is dispatched to executor_manager.
+    RCLCPP_INFO(
+      this->get_logger(),
+      "CURRENT_INSTRUCTION: '%s'",
+      current_instruction_.c_str());
+  }
+
   // ===== Helpers =====
   bool getLatestStatus(supervisor_interfaces::msg::SystemStatus & out)
   {
@@ -453,6 +473,12 @@ private:
     }
     plan_ready_signal_ = false;
     return true;
+  }
+
+  std::string getCurrentInstruction()
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return got_current_instruction_ ? current_instruction_ : "";
   }
 
   void publishRetryCommand()
@@ -958,6 +984,7 @@ private:
     execution_feedback_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr plan_active_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr plan_ready_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr current_instruction_sub_;
 
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr rewind_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_next_instruction_pub_;
@@ -997,6 +1024,8 @@ private:
   bool plan_active_{false};
   bool got_plan_active_{false};
   bool plan_ready_signal_{false};
+  std::string current_instruction_;
+  bool got_current_instruction_{false};
 };
 
 namespace
