@@ -38,13 +38,16 @@ public:
       "natural_language_planning=%s",
       natural_language_planning_ ? "true" : "false");
 
-    // --- Subscribers ---
+    // --- Entradas ROS ---
+    // /system/status indica si los modulos minimos estan disponibles.
     sub_status_ = this->create_subscription<supervisor_interfaces::msg::SystemStatus>(
       "/system/status",
       rclcpp::QoS(10),
       std::bind(&SupervisorManagerNode::statusCallback, this, std::placeholders::_1)
     );
 
+    // Resultado validado por supervisor_execution despues de que executor_worker
+    // termina una accion.
     execution_feedback_sub_ =
       this->create_subscription<supervisor_interfaces::msg::TaskExecutionReport>(
       "/supervisor/supervisor_execution/result",
@@ -52,36 +55,48 @@ public:
       std::bind(&SupervisorManagerNode::executionFeedbackCallback, this, std::placeholders::_1)
     );
 
+    // Estado del plan: true si aun quedan instrucciones por ejecutar.
     plan_active_sub_ = this->create_subscription<std_msgs::msg::Bool>(
       "/supervisor/supervisor_plan/active",
       rclcpp::QoS(10),
       std::bind(&SupervisorManagerNode::planActiveCallback, this, std::placeholders::_1)
     );
 
+    // Pulso enviado por supervisor_plan cuando ya parseo el plan publicado por CLIPS.
     plan_ready_sub_ = this->create_subscription<std_msgs::msg::Empty>(
       "/supervisor/supervisor_plan/plan_ready",
       rclcpp::QoS(10),
       std::bind(&SupervisorManagerNode::planReadyCallback, this, std::placeholders::_1)
     );
 
+    // Solo se usa para observabilidad: registra cual instruccion despacho el plan.
     current_instruction_sub_ = this->create_subscription<std_msgs::msg::String>(
       "/instruction_msg",
       rclcpp::QoS(10),
       std::bind(&SupervisorManagerNode::currentInstructionCallback, this, std::placeholders::_1)
     );
 
-    // --- Publishers ---
+    // --- Salidas ROS ---
+    // Rewind permite pedirle a supervisor_plan que repita la instruccion anterior.
 	rewind_pub_ = create_publisher<std_msgs::msg::Empty>("/supervisor/supervisor_plan/rewind_one", 10);
 
+    // Semaforos de un solo disparo: uno habilita al plan a entregar una
+    // instruccion y el otro dispara la ejecucion.
     allow_next_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
       "/supervisor/supervisor_manager/allow_next_instruction", 10);
     allow_plan_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
       "/supervisor/supervisor_manager/allow_plan_instruction", 10);
+
+    // Comandos auxiliares para supervisor_plan: por ahora 1 significa retry.
     instruction_cmd_pub_ = this->create_publisher<std_msgs::msg::Int32>(
       "/supervisor/supervisor_manager/instruction_command", 10);
+
+    // Inyeccion de una instruccion correctiva, por ejemplo pedir repetir un dato.
 	corrective_instruction_pub_ = this->create_publisher<std_msgs::msg::String>(
 	  "/supervisor/supervisor_manager/instruction", 10);
 
+    // Clientes usados por el pipeline opcional de lenguaje natural y por los
+    // mensajes hablados de error.
     hri_client_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     talker_client_ = this->create_client<talker_interfaces::srv::Talk>(
       "/hri/talker/talk",
@@ -96,13 +111,14 @@ public:
       rmw_qos_profile_services_default,
       hri_client_group_);
 
-    // --- FSM Timer (10 Hz) ---
+    // --- Timer principal del FSM (10 Hz) ---
     timer_ = this->create_wall_timer(
       100ms,
       std::bind(&SupervisorManagerNode::tick, this)
     );
 
-    // --- One-shot init for tools needing shared_from_this() ---
+    // --- Inicializacion diferida ---
+    // Planning necesita shared_from_this(), por eso se crea despues del constructor.
     init_timer_ = this->create_wall_timer(
       0ms,
       std::bind(&SupervisorManagerNode::initToolsOnce, this)
@@ -112,12 +128,16 @@ public:
 private:
   enum class State : uint8_t
   {
+    // Arranque y verificacion de modulos minimos.
     SM_INIT,
     SM_VERIFY_SYS,
 
+    // Creacion/recepcion del plan antes de ejecutar instrucciones.
     SM_CREATE_PLAN,
     SM_WAIT_PLAN_READY,
     SM_POST_PLAN_TRIGGER,
+
+    // Ciclo de ejecucion: espera resultado y decide si avanza, reintenta o termina.
     SM_WAIT_EXECUTION_RESULT,
 
     SM_FINISH
@@ -134,7 +154,8 @@ private:
     RCLCPP_INFO(this->get_logger(), "Planning tool initialized");
   }
 
-  // ===== Pipeline helpers =====
+  // ===== Helpers del pipeline opcional de lenguaje natural =====
+  // Este bloque solo se usa cuando natural_language_planning_ es true.
   bool goToLocation(const std::string & location_name)
   {
     if (!goto_client_) {
@@ -303,6 +324,12 @@ private:
 
   bool runNaturalLanguagePipeline()
   {
+    // Pipeline GPSR interactivo:
+    // 1) ir al punto de instrucciones,
+    // 2) pedir comando,
+    // 3) escuchar,
+    // 4) parsear a representacion semantica,
+    // 5) convertir a hechos CLIPS para que planning publique un plan.
     if (!planning_) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
@@ -350,7 +377,9 @@ private:
     return true;
   }
 
-  // ===== Callbacks =====
+  // ===== Callbacks ROS =====
+  // Los callbacks solo actualizan estado compartido; la logica de decision vive
+  // en tick(), lo que mantiene el flujo del supervisor en un solo lugar.
   void statusCallback(const supervisor_interfaces::msg::SystemStatus::SharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -415,8 +444,26 @@ private:
     return true;
   }
 
-  void publishAllowNextCycle()
+  bool publishAllowNextCycle()
   {
+    // Evita perder el semaforo de un solo disparo si algun nodo aun no descubre
+    // sus subscribers; en ese caso el FSM permanece en el estado actual y reintenta.
+    const size_t plan_subscribers =
+      allow_plan_instruction_pub_->get_subscription_count();
+    const size_t execution_subscribers =
+      allow_next_instruction_pub_->get_subscription_count();
+
+    if (plan_subscribers == 0 || execution_subscribers == 0)
+    {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Manager semaphore not sent: waiting subscribers "
+        "allow_plan_instruction=%zu allow_next_instruction=%zu",
+        plan_subscribers,
+        execution_subscribers);
+      return false;
+    }
+
     {
       std::lock_guard<std::mutex> lock(mtx_);
       got_plan_active_ = false;
@@ -428,6 +475,7 @@ private:
     // processed allow_plan_instruction.
     allow_plan_instruction_pub_->publish(std_msgs::msg::Empty{});
     scheduleExecutionTrigger();
+    return true;
   }
 
   void scheduleExecutionTrigger()
@@ -483,6 +531,7 @@ private:
 
   void publishRetryCommand()
   {
+    // supervisor_plan interpreta command=1 como "reenviar la ultima instruccion".
     std_msgs::msg::Int32 msg;
     msg.data = 1;
     instruction_cmd_pub_->publish(msg);
@@ -490,6 +539,8 @@ private:
 
   bool needsApprovalRetry(const std::string & action) const
   {
+    // Acciones que pueden beneficiarse de reintento/correccion en vez de
+    // simplemente continuar con el siguiente paso.
     std::string normalized = action;
     std::transform(
       normalized.begin(),
@@ -504,6 +555,8 @@ private:
 
   bool isExecutionFailureStatus(uint8_t status) const
   {
+    // approved=false y estos estados se tratan como fallo recuperable:
+    // el robot anuncia el problema y continua con la siguiente instruccion.
     return status == supervisor_interfaces::msg::TaskExecutionReport::FAILURE ||
            status == supervisor_interfaces::msg::TaskExecutionReport::TIMEOUT ||
            status == supervisor_interfaces::msg::TaskExecutionReport::REJECTED;
@@ -554,6 +607,8 @@ private:
   void handleDoorClosedCheck(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
+    // Caso especial: una puerta cerrada no cancela todo el plan.
+    // Se pide ayuda, se espera un poco y se reintenta el mismo check.
     RCLCPP_WARN(
       this->get_logger(),
       "SM_WAIT_EXECUTION_RESULT: door is closed; requesting human assistance and retrying. worker='%s'",
@@ -616,7 +671,9 @@ private:
     const supervisor_interfaces::msg::TaskExecutionReport & feedback,
     const std::string & fallback_reason) const
   {
-    if (feedback.worker_result.rfind("navigation_failed", 0) == 0) {
+    // Para el habla usamos primero el mensaje del worker: normalmente contiene
+    // el detalle util para el usuario, mientras failure_reason es una etiqueta interna.
+    if (!feedback.worker_result.empty()) {
       return makeSpeechFriendly(feedback.worker_result);
     }
 
@@ -624,10 +681,6 @@ private:
         feedback.failure_reason != supervisor_interfaces::msg::TaskExecutionReport::REASON_NONE)
     {
       return makeSpeechFriendly(feedback.failure_reason);
-    }
-
-    if (!feedback.worker_result.empty()) {
-      return makeSpeechFriendly(feedback.worker_result);
     }
 
     return makeSpeechFriendly(fallback_reason);
@@ -665,11 +718,12 @@ private:
     publishAllowNextCycle();
   }
 
-  // AGREGAR junto a needsApprovalRetry():
   std::string getCorrectiveInstruction(
     const std::string & action,
     const std::string & argument) const
   {
+    // Instrucciones correctivas para fallos de escucha. El objetivo es decir
+    // algo antes de repetir la instruccion original.
     if (action == "listen" || action == "listen_for") {
       if (argument == "name")     return "Justina say repeat_name";
       if (argument == "drink")    return "Justina say repeat_drink";
@@ -685,6 +739,7 @@ private:
     {
       case State::SM_INIT:
       {
+        // Primer estado: solo anuncia arranque y pasa a esperar /system/status.
         RCLCPP_INFO(this->get_logger(), "SM_INIT: Init");
         RCLCPP_INFO(this->get_logger(), "SM_INIT: Waiting messages on /system/status ...");
         state_ = State::SM_VERIFY_SYS;
@@ -693,6 +748,7 @@ private:
 
       case State::SM_VERIFY_SYS:
       {
+        // No se crea plan hasta que supervisor_system reporte modulos minimos OK.
         supervisor_interfaces::msg::SystemStatus st;
         if (!getLatestStatus(st))
         {
@@ -724,6 +780,8 @@ private:
 
       case State::SM_CREATE_PLAN:
       {
+        // Crea el plan. En modo directo pide a planning iniciar; en modo
+        // lenguaje natural primero obtiene y convierte una instruccion hablada.
         if (!planning_) {
           RCLCPP_WARN_THROTTLE(
             this->get_logger(), *this->get_clock(), 2000,
@@ -770,6 +828,8 @@ private:
 
       case State::SM_WAIT_PLAN_READY:
       {
+        // Espera confirmacion explicita de supervisor_plan para evitar pedir
+        // una instruccion antes de que el plan haya sido parseado.
         if (!consumePlanReadySignal())
         {
           RCLCPP_DEBUG_THROTTLE(
@@ -793,13 +853,19 @@ private:
                     "SM_POST_PLAN_TRIGGER: plan ready.");
         RCLCPP_INFO(this->get_logger(),
                     "SM_POST_PLAN_TRIGGER: Manager semaphore -> allow one plan dispatch + allow execution trigger");
-        publishAllowNextCycle();
+        // Si todavia no hay subscribers para el semaforo, no avanzamos a esperar
+        // feedback de ejecucion porque nadie habria recibido la orden inicial.
+        if (!publishAllowNextCycle()) {
+          break;
+        }
         state_ = State::SM_WAIT_EXECUTION_RESULT;
         break;
       }
 
       case State::SM_WAIT_EXECUTION_RESULT:
       {
+        // Estado principal del ciclo: aqui se consume el resultado de la accion
+        // anterior y se decide si se pide otra instruccion, se reintenta o termina.
         // Door retries are scheduled locally by the manager. No new planner step
         // is requested until the same check succeeds.
         if (door_retry_pending_)
@@ -1001,17 +1067,26 @@ private:
   rclcpp::TimerBase::SharedPtr execution_trigger_timer_;
 
   // Tools
+  // Fachada hacia planning_tools: startPlanning, semantic parser y primitive_to_clips.
   std::shared_ptr<Planning> planning_;
+
+  // false: usa un plan CLIPS ya definido. true: pide una orden hablada y genera
+  // hechos CLIPS antes de planear.
   bool natural_language_planning_{false};
 
   // FSM
   State state_{State::SM_INIT};
 
   // Shared state
+  // Estado actualizado por callbacks y consumido por tick().
   std::mutex mtx_;
   std::optional<supervisor_interfaces::msg::SystemStatus> last_status_;
   bool got_status_{false};
+
+  // Evita encadenar multiples instrucciones correctivas para el mismo fallo.
   bool corrective_pending_ = false;
+
+  // Estado del episodio "puerta cerrada".
   static constexpr int MAX_DOOR_OPEN_REQUESTS = 3;
   bool door_waiting_active_{false};
   bool door_retry_pending_{false};
@@ -1021,9 +1096,12 @@ private:
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
 
+  // Estado reportado por supervisor_plan.
   bool plan_active_{false};
   bool got_plan_active_{false};
   bool plan_ready_signal_{false};
+
+  // Instruccion actual solo para logs/diagnostico.
   std::string current_instruction_;
   bool got_current_instruction_{false};
 };
@@ -1032,6 +1110,7 @@ namespace
 {
 bool parseBooleanValue(const std::string & value, bool & out)
 {
+  // Parser tolerante para argumentos booleanos de CLI/launch.
   std::string normalized = value;
   std::transform(
     normalized.begin(),
@@ -1054,6 +1133,8 @@ bool parseBooleanValue(const std::string & value, bool & out)
 
 bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
 {
+  // Se parsea manualmente porque este nodo puede correrse con ros2 run o desde
+  // launch; soporta natural_language_planning=true y natural_language_planning:=true.
   bool value = false;
   bool found = false;
 
