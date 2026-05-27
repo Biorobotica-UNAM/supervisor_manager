@@ -553,6 +553,339 @@ private:
             normalized == "listen");
   }
 
+  bool isSayAskAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    // Primer paso del patron de confirmacion:
+    // "Justina say ask_name", "Justina say ask_drink", etc.
+    const std::string action = normalizeText(feedback.action);
+    const std::string argument = normalizeText(feedback.argument);
+
+    return action == "say" && argument.rfind("ask_", 0U) == 0U;
+  }
+
+  bool isListenAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    return action == "listen";
+  }
+
+  bool isFullListenArgument(const std::string & argument) const
+  {
+    // Listen en modo FULL guarda en world state y usa el formato:
+    // <categoria>_<atributo>_<indice>, por ejemplo guest_name_1.
+    const std::size_t last_sep = argument.rfind('_');
+    if (last_sep == std::string::npos || last_sep == 0 ||
+        last_sep + 1 >= argument.size())
+    {
+      return false;
+    }
+
+    const std::string prefix = argument.substr(0, last_sep);
+    const std::size_t second_sep = prefix.rfind('_');
+    return second_sep != std::string::npos &&
+           second_sep > 0 &&
+           second_sep + 1 < prefix.size();
+  }
+
+  std::string listenAttributeFromArgument(const std::string & argument) const
+  {
+    // De guest_name_1 extrae "name"; se usa para construir la frase
+    // "I understood your name is ...".
+    const std::size_t last_sep = argument.rfind('_');
+    if (last_sep == std::string::npos || last_sep == 0) {
+      return argument;
+    }
+
+    const std::string prefix = argument.substr(0, last_sep);
+    const std::size_t second_sep = prefix.rfind('_');
+    if (second_sep == std::string::npos || second_sep + 1 >= prefix.size()) {
+      return argument;
+    }
+
+    return prefix.substr(second_sep + 1);
+  }
+
+  std::string extractStoredListenValue(const std::string & worker_result) const
+  {
+    // Listen devuelve el dato guardado como "people[1].name=sergio".
+    // Aqui tomamos solo la parte despues del '='.
+    const std::size_t eq = worker_result.find('=');
+    if (eq == std::string::npos || eq + 1 >= worker_result.size()) {
+      return "";
+    }
+
+    return worker_result.substr(eq + 1);
+  }
+
+  std::string confirmationPhrase(
+    const std::string & listen_argument,
+    const std::string & value) const
+  {
+    // Frase hablada para confirmar el dato antes de avanzar en el plan.
+    const std::string attribute =
+      makeSpeechFriendly(listenAttributeFromArgument(listen_argument));
+
+    if (attribute == "name") {
+      return "I understood your name is " + value + ". Is that correct?";
+    }
+
+    if (attribute == "drink") {
+      return "I understood your drink is " + value + ". Is that correct?";
+    }
+
+    return "I understood " + attribute + " as " + value + ". Is that correct?";
+  }
+
+  std::string listenYesNo()
+  {
+    // Confirmacion fuera del plan: usa directamente HRI/listener para no
+    // consumir otra instruccion del plan mientras se valida el dato.
+    if (!listener_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[Confirmation] Listen client not initialized");
+      return "";
+    }
+
+    if (!listener_client_->wait_for_service(1s)) {
+      RCLCPP_ERROR(this->get_logger(), "[Confirmation] Listen service unavailable");
+      return "";
+    }
+
+    auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
+    request->enable = true;
+    // test.json contiene yes/no; cambiar esta gramatica si se crea una dedicada.
+    request->grammar = "test.json";
+
+    auto future = listener_client_->async_send_request(request);
+    const auto status = future.wait_for(8s);
+    if (status != std::future_status::ready) {
+      RCLCPP_ERROR(this->get_logger(), "[Confirmation] Listen yes/no timeout");
+      return "";
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_WARN(this->get_logger(), "[Confirmation] No yes/no response received");
+      return "";
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Confirmation] Heard yes/no response: '%s'",
+      response->recognized_speech.c_str());
+    return response->recognized_speech;
+  }
+
+  bool isYesAnswer(const std::string & text) const
+  {
+    const std::string normalized = normalizeText(text);
+    return normalized.find("yes") != std::string::npos ||
+           normalized.find("yeah") != std::string::npos ||
+           normalized.find("correct") != std::string::npos ||
+           normalized.find("right") != std::string::npos ||
+           normalized.find("continue") != std::string::npos;
+  }
+
+  bool isNoAnswer(const std::string & text) const
+  {
+    const std::string normalized = normalizeText(text);
+    return normalized.find("no") != std::string::npos ||
+           normalized.find("nope") != std::string::npos ||
+           normalized.find("wrong") != std::string::npos ||
+           normalized.find("incorrect") != std::string::npos;
+  }
+
+  void clearDataConfirmation()
+  {
+    pending_confirmation_ask_key_.clear();
+    pending_confirmation_listen_argument_.clear();
+    pending_confirmation_value_.clear();
+    confirmation_attempts_ = 0;
+  }
+
+  void rememberAskPrompt(const std::string & ask_key)
+  {
+    if (pending_confirmation_ask_key_ != ask_key) {
+      confirmation_attempts_ = 0;
+    }
+
+    pending_confirmation_ask_key_ = ask_key;
+    pending_confirmation_listen_argument_.clear();
+    pending_confirmation_value_.clear();
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Confirmation] Tracking ask prompt '%s'",
+      pending_confirmation_ask_key_.c_str());
+  }
+
+  bool retryDataCapture()
+  {
+    // Repite la pareja ask/listen usando las herramientas ya existentes:
+    // 1) rewind_one hace que supervisor_plan repita el listen actual,
+    // 2) corrective_instruction_pub_ inyecta antes el "Justina say ask_*".
+    if (pending_confirmation_ask_key_.empty()) {
+      return false;
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Confirmation] Repeating data capture with '%s' (attempt %d/%d)",
+      pending_confirmation_ask_key_.c_str(),
+      confirmation_attempts_ + 1,
+      MAX_CONFIRMATION_ATTEMPTS);
+
+    rewind_pub_->publish(std_msgs::msg::Empty{});
+
+    std_msgs::msg::String inj;
+    inj.data = "Justina say " + pending_confirmation_ask_key_;
+    corrective_instruction_pub_->publish(inj);
+
+    publishAllowNextCycle();
+    return true;
+  }
+
+  bool handleDataConfirmation(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Devuelve true cuando este helper ya disparo un reintento y el FSM debe
+    // quedarse esperando el siguiente resultado sin avanzar el plan.
+    // Detecta el primer paso del patron: "Justina say ask_*".
+    if (isSayAskAction(feedback)) {
+      rememberAskPrompt(feedback.argument);
+      return false;
+    }
+
+    // Si habia una pregunta ask_* pendiente, la siguiente instruccion relevante
+    // debe ser un listen FULL como guest_name_1. Otro tipo de accion cancela
+    // la confirmacion para no mezclar datos entre pasos.
+    if (!pending_confirmation_ask_key_.empty() && !isListenAction(feedback)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Confirmation] Expected listen after '%s' but got action '%s'; clearing confirmation state",
+        pending_confirmation_ask_key_.c_str(),
+        feedback.action.c_str());
+      clearDataConfirmation();
+      return false;
+    }
+
+    if (pending_confirmation_ask_key_.empty() || !isListenAction(feedback)) {
+      return false;
+    }
+
+    if (!isFullListenArgument(feedback.argument)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Confirmation] Listen argument '%s' is not a stored-parameter listen; skipping confirmation",
+        feedback.argument.c_str());
+      clearDataConfirmation();
+      return false;
+    }
+
+    const std::string value = extractStoredListenValue(feedback.worker_result);
+    if (value.empty()) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Confirmation] Could not extract stored value from worker_result '%s'",
+        feedback.worker_result.c_str());
+      clearDataConfirmation();
+      return false;
+    }
+
+    pending_confirmation_listen_argument_ = feedback.argument;
+    pending_confirmation_value_ = value;
+    ++confirmation_attempts_;
+
+    const std::string phrase = confirmationPhrase(
+      pending_confirmation_listen_argument_,
+      pending_confirmation_value_);
+
+    // Si el yes/no no se entiende, se repite solo la confirmacion. No volvemos
+    // a pedir el dato completo a menos que el usuario responda explicitamente no.
+    for (int yes_no_attempt = 1;
+         yes_no_attempt <= MAX_CONFIRMATION_ATTEMPTS;
+         ++yes_no_attempt)
+    {
+      if (yes_no_attempt > 1) {
+        sayText("I could not understand if that was correct. Please answer yes or no.");
+      }
+
+      sayText(phrase);
+
+      const std::string answer = listenYesNo();
+      if (isYesAnswer(answer)) {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[Confirmation] User confirmed '%s'='%s'",
+          pending_confirmation_listen_argument_.c_str(),
+          pending_confirmation_value_.c_str());
+        clearDataConfirmation();
+        return false;
+      }
+
+      if (isNoAnswer(answer)) {
+        if (confirmation_attempts_ < MAX_CONFIRMATION_ATTEMPTS) {
+          return retryDataCapture();
+        }
+
+        break;
+      }
+    }
+
+    bool active_plan = true;
+    const bool knows_plan_state = getPlanActiveStatus(active_plan);
+    sayText(
+      (knows_plan_state && !active_plan)
+        ? "I could not confirm the information. There are no more steps in the plan."
+        : "I could not confirm the information. I will continue with the task.");
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Confirmation] Max attempts reached for '%s'; continuing",
+      pending_confirmation_listen_argument_.c_str());
+    clearDataConfirmation();
+    return false;
+  }
+
+  bool handleDataCaptureFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Si falla el listen que venia despues de un ask_*, no avanzamos el plan:
+    // repetimos la pregunta y el listen hasta MAX_CONFIRMATION_ATTEMPTS.
+    if (pending_confirmation_ask_key_.empty() || !isListenAction(feedback)) {
+      return false;
+    }
+
+    ++confirmation_attempts_;
+
+    if (confirmation_attempts_ < MAX_CONFIRMATION_ATTEMPTS) {
+      sayText("I could not hear the answer. I will ask again.");
+      return retryDataCapture();
+    }
+
+    bool active_plan = true;
+    const bool knows_plan_state = getPlanActiveStatus(active_plan);
+    sayText(
+      (knows_plan_state && !active_plan)
+        ? "I could not get the information. There are no more steps in the plan."
+        : "I could not get the information. I will continue with the task.");
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Confirmation] Listen failed after %d attempts for '%s'; continuing",
+      MAX_CONFIRMATION_ATTEMPTS,
+      pending_confirmation_ask_key_.c_str());
+    clearDataConfirmation();
+    if (knows_plan_state && !active_plan) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Confirmation] Listen failed on last instruction -> finish without dispatching another step");
+      state_ = State::SM_FINISH;
+      return true;
+    }
+    publishAllowNextCycle();
+    return true;
+  }
+
   bool isExecutionFailureStatus(uint8_t status) const
   {
     // approved=false y estos estados se tratan como fallo recuperable:
@@ -690,26 +1023,47 @@ private:
     const supervisor_interfaces::msg::TaskExecutionReport & feedback,
     const std::string & reason)
   {
+    bool active_plan = true;
+    const bool knows_plan_state = getPlanActiveStatus(active_plan);
+
     RCLCPP_ERROR(
       this->get_logger(),
-      "SM_WAIT_EXECUTION_RESULT: action failed; announcing and continuing. action='%s' arg='%s' status=%s approved=%s reason='%s' worker='%s'",
+      "SM_WAIT_EXECUTION_RESULT: action failed. action='%s' arg='%s' status=%s approved=%s reason='%s' worker='%s' plan_active_known=%s plan_active=%s",
       feedback.action.c_str(),
       feedback.argument.c_str(),
       executionStatusName(feedback.status).c_str(),
       feedback.approved ? "true" : "false",
       reason.c_str(),
-      feedback.worker_result.c_str());
+      feedback.worker_result.c_str(),
+      knows_plan_state ? "true" : "false",
+      active_plan ? "true" : "false");
 
     std::string spoken = "I could not complete action " + makeSpeechFriendly(feedback.action);
     if (!feedback.argument.empty()) {
       spoken += " " + makeSpeechFriendly(feedback.argument);
     }
-    spoken += " because " + failureReasonForSpeech(feedback, reason) + ". I will continue with the next step.";
+    spoken += " because " + failureReasonForSpeech(feedback, reason) + ".";
+
+    // Si supervisor_plan ya reporto que no quedan instrucciones, no prometemos
+    // un siguiente paso ni disparamos otro ciclo de ejecucion.
+    if (knows_plan_state && !active_plan) {
+      spoken += " There are no more steps in the plan.";
+    } else {
+      spoken += " I will continue with the next step.";
+    }
 
     if (!sayText(spoken)) {
       RCLCPP_WARN(
         this->get_logger(),
         "SM_WAIT_EXECUTION_RESULT: could not announce failure through TTS");
+    }
+
+    if (knows_plan_state && !active_plan) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "SM_WAIT_EXECUTION_RESULT: failed on last instruction -> finish without dispatching another step");
+      state_ = State::SM_FINISH;
+      return;
     }
 
     RCLCPP_INFO(
@@ -724,7 +1078,7 @@ private:
   {
     // Instrucciones correctivas para fallos de escucha. El objetivo es decir
     // algo antes de repetir la instruccion original.
-    if (action == "listen" || action == "listen_for") {
+    if (action == "listen") {
       if (argument == "name")     return "Justina say repeat_name";
       if (argument == "drink")    return "Justina say repeat_drink";
       return "Justina say please_repeat";   // fallback genérico
@@ -922,6 +1276,10 @@ private:
 
         if (!feedback.approved || isExecutionFailureStatus(feedback.status))
         {
+          if (handleDataCaptureFailure(feedback)) {
+            break;
+          }
+
           const std::string status_name = executionStatusName(feedback.status);
           std::string reason;
           if (!feedback.failure_reason.empty() &&
@@ -966,6 +1324,13 @@ private:
         {
           if (door_waiting_active_ && isDoorOpenCheckSuccess(feedback)) {
             sayText("I detected that the door is open. Thank you.");
+          }
+
+          // Confirma datos escuchados cuando el plan hizo say ask_* seguido de
+          // listen <parametro>. Si el usuario dice que no, este helper inyecta
+          // otra vez el say ask_* y rebobina el listen actual.
+          if (handleDataConfirmation(feedback)) {
+            break;
           }
 
           // Any successful execution clears a pending door-wait episode.
@@ -1085,6 +1450,14 @@ private:
 
   // Evita encadenar multiples instrucciones correctivas para el mismo fallo.
   bool corrective_pending_ = false;
+
+  // Estado para confirmar datos guardados por patrones say ask_* + listen X.
+  // La cantidad maxima de intentos se define aqui.
+  static constexpr int MAX_CONFIRMATION_ATTEMPTS = 3;
+  std::string pending_confirmation_ask_key_;
+  std::string pending_confirmation_listen_argument_;
+  std::string pending_confirmation_value_;
+  int confirmation_attempts_{0};
 
   // Estado del episodio "puerta cerrada".
   static constexpr int MAX_DOOR_OPEN_REQUESTS = 3;
