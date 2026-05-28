@@ -808,10 +808,10 @@ private:
          ++yes_no_attempt)
     {
       if (yes_no_attempt > 1) {
-        sayText("I could not understand if that was correct. Please answer yes or no.");
+        sayText("I could not understand if that was correct. " + phrase);
+      } else {
+        sayText(phrase);
       }
-
-      sayText(phrase);
 
       const std::string answer = listenYesNo();
       if (isYesAnswer(answer)) {
