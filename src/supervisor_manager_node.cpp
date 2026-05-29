@@ -208,7 +208,11 @@ private:
   bool goToInstructionPoint()
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step -1] Navigating to instruction_point...");
-    return goToLocation("instruction_point");
+    const bool arrived = goToLocation("instruction_point");
+    if (arrived) {
+      at_instruction_point_ = true;
+    }
+    return arrived;
   }
 
   bool sayText(const std::string & text)
@@ -251,6 +255,27 @@ private:
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 0] Prompting user for a command...");
     return sayText("Please tell me your command.");
+  }
+
+  bool askUserToRepeatCommand(int attempt)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user to repeat command, retry %d/%d...",
+      attempt,
+      MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
+    return sayText("I did not understand your command. Please repeat the instruction.");
+  }
+
+  void announceNaturalLanguageSequenceRestart()
+  {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 1] Listen retries exhausted; restarting full instruction sequence");
+    sayText(
+      "I still could not understand your command. "
+      "I will restart the sequence from the beginning and navigate to the instruction point again.");
+    at_instruction_point_ = false;
   }
 
   std::string stepListen()
@@ -340,11 +365,17 @@ private:
     RCLCPP_INFO(this->get_logger(), "──────────────────────────────────────");
     RCLCPP_INFO(this->get_logger(), "Natural language pipeline started");
 
-    sayText("Im ready for GPSR task, ill navigate to the intruction point, please open the door.");
+    if (!at_instruction_point_) {
+      sayText("Im ready for GPSR task, ill navigate to the instruction point, please open the door.");
 
-    if (!goToInstructionPoint()) {
-      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step -1: goToInstructionPoint failed");
-      return false;
+      if (!goToInstructionPoint()) {
+        RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step -1: goToInstructionPoint failed");
+        return false;
+      }
+    } else {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Pipeline][Step -1] Already at instruction_point; skipping intro and navigation");
     }
 
     if (!promptForCommand()) {
@@ -352,9 +383,31 @@ private:
       return false;
     }
 
-    const std::string text = stepListen();
+    std::string text;
+    for (int retry = 0; retry <= MAX_NATURAL_LANGUAGE_LISTEN_RETRIES; ++retry) {
+      text = stepListen();
+      if (!text.empty()) {
+        break;
+      }
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Pipeline listen attempt %d/%d failed",
+        retry + 1,
+        MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+
+      if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES && !askUserToRepeatCommand(retry + 1)) {
+        RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: askUserToRepeatCommand failed");
+        return false;
+      }
+    }
+
     if (text.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 1: Listen returned empty");
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "Pipeline failed at step 1: Listen returned empty after %d retries",
+        MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
+      announceNaturalLanguageSequenceRestart();
       return false;
     }
 
@@ -929,6 +982,35 @@ private:
            worker_result.rfind("door_open", 0U) == 0U;
   }
 
+  bool isSuccessfulGoTo(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    return (action == "go_to" || action == "goto") &&
+           feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS &&
+           feedback.approved;
+  }
+
+  void updateInstructionPointStateFromGoTo(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (!natural_language_planning_ || !isSuccessfulGoTo(feedback)) {
+      return;
+    }
+
+    const std::string destination = normalizeText(feedback.argument);
+    if (destination.empty()) {
+      return;
+    }
+
+    at_instruction_point_ = (destination == "instruction_point");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "SM_WAIT_EXECUTION_RESULT: go_to succeeded to '%s'; at_instruction_point=%s",
+      feedback.argument.c_str(),
+      at_instruction_point_ ? "true" : "false");
+  }
+
   void scheduleDoorCheckRetry()
   {
     // Give the human a short window to open the door before dispatching the
@@ -1322,6 +1404,8 @@ private:
 
         if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
+          updateInstructionPointStateFromGoTo(feedback);
+
           if (door_waiting_active_ && isDoorOpenCheckSuccess(feedback)) {
             sayText("I detected that the door is open. Thank you.");
           }
@@ -1438,6 +1522,8 @@ private:
   // false: usa un plan CLIPS ya definido. true: pide una orden hablada y genera
   // hechos CLIPS antes de planear.
   bool natural_language_planning_{false};
+  static constexpr int MAX_NATURAL_LANGUAGE_LISTEN_RETRIES = 3;
+  bool at_instruction_point_{false};
 
   // FSM
   State state_{State::SM_INIT};
