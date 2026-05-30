@@ -8,9 +8,12 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(actionlib_msgs REQUIRED)
 
+find_package(executor_interfaces REQUIRED)
 find_package(supervisor_interfaces REQUIRED)
 find_package(planning_tools REQUIRED)
 find_package(clips_interfaces REQUIRED)
@@ -26,6 +29,8 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(supervisor_manager_node src/supervisor_manager_node.cpp)
+add_executable(supervisor_goto_test_node src/supervisor_goto_test_node.cpp)
+add_executable(supervisor_test_node src/supervisor_test_node.cpp)
 
 target_include_directories(supervisor_manager_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -44,8 +49,24 @@ ament_target_dependencies(supervisor_manager_node
   talker_interfaces
 )
 
+ament_target_dependencies(supervisor_goto_test_node
+  rclcpp
+  rclcpp_action
+  std_msgs
+  actionlib_msgs
+  executor_interfaces
+)
+
+ament_target_dependencies(supervisor_test_node
+  rclcpp
+  rclcpp_action
+  executor_interfaces
+)
+
 install(TARGETS
   supervisor_manager_node
+  supervisor_goto_test_node
+  supervisor_test_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -57,8 +78,11 @@ install(
 ament_export_include_directories(include)
 ament_export_dependencies(
   rclcpp
+  rclcpp_action
   std_msgs
   std_srvs
+  actionlib_msgs
+  executor_interfaces
   supervisor_interfaces
   clips_interfaces
   planning_tools
