@@ -143,6 +143,18 @@ private:
     SM_FINISH
   };
 
+  enum class FollowGiftState : uint8_t
+  {
+    // Sub-FSM local para el caso say instruct_follow_person
+    // sin consumir pasos fijos del plan CLIPS.
+    IDLE,
+    WAIT_INITIAL_ANSWER,
+    WAIT_FOLLOW_ENABLE,
+    WAIT_STOP_ANSWER,
+    WAIT_FOLLOW_DISABLE,
+    WAIT_DROP_GIFT
+  };
+
   // ===== One-shot init =====
   void initToolsOnce()
   {
@@ -588,6 +600,202 @@ private:
     std_msgs::msg::Int32 msg;
     msg.data = 1;
     instruction_cmd_pub_->publish(msg);
+  }
+
+  void publishOverrideInstruction(const std::string & instruction)
+  {
+    // Inyecta una instruccion temporal en supervisor_plan. Esa instruccion se
+    // ejecuta antes del siguiente paso normal del plan.
+    std_msgs::msg::String inj;
+    inj.data = instruction;
+    corrective_instruction_pub_->publish(inj);
+  }
+
+  bool dispatchOverrideInstruction(const std::string & instruction)
+  {
+    // Publica el override y libera exactamente un ciclo plan->executor.
+    publishOverrideInstruction(instruction);
+    return publishAllowNextCycle();
+  }
+
+  bool isSuccessfulFeedback(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return feedback.approved &&
+           feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS;
+  }
+
+  bool feedbackMatches(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback,
+    const std::string & action,
+    const std::string & argument) const
+  {
+    return normalizeText(feedback.action) == action &&
+           normalizeText(feedback.argument) == argument;
+  }
+
+  bool answerHasStop(const std::string & worker_result) const
+  {
+    // Listen SIMPLE devuelve algo como "answer=stop"; se busca la palabra clave
+    // dentro del resultado completo para tolerar variantes del worker.
+    return normalizeText(worker_result).find("stop") != std::string::npos;
+  }
+
+  bool answerHasFollowOrContinue(const std::string & worker_result) const
+  {
+    // El primer listen acepta follow o continue como permiso para activar
+    // seguimiento humano.
+    const std::string answer = normalizeText(worker_result);
+    return answer.find("follow") != std::string::npos ||
+           answer.find("continue") != std::string::npos;
+  }
+
+  bool dispatchFollowGiftListen(FollowGiftState next_state)
+  {
+    // Mantiene el listen activo de forma reactiva: cada intento es una nueva
+    // instruccion "listen answer" disparada por el manager.
+    follow_gift_state_ = next_state;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[FollowGift] dispatching listen answer; next_state=%u",
+      static_cast<unsigned int>(follow_gift_state_));
+    return dispatchOverrideInstruction("Justina listen answer");
+  }
+
+  bool dispatchFollowGiftInstruction(
+    const std::string & instruction,
+    FollowGiftState next_state)
+  {
+    follow_gift_state_ = next_state;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[FollowGift] dispatching '%s'; next_state=%u",
+      instruction.c_str(),
+      static_cast<unsigned int>(follow_gift_state_));
+    return dispatchOverrideInstruction(instruction);
+  }
+
+  bool refreshFollowGiftListen(const std::string & reason)
+  {
+    // Durante la espera de stop se descarta cualquier respuesta no util y se
+    // vuelve a escuchar sin avanzar al siguiente paso del plan.
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[FollowGift] ignoring answer '%s'; listening again",
+      reason.c_str());
+    return dispatchFollowGiftListen(follow_gift_state_);
+  }
+
+  bool handleFollowGiftSequence(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Punto de entrada: cuando termina "say instruct_follow_person", el plan deja
+    // el control al manager para decidir dinamicamente segun lo que escuche.
+    if (follow_gift_state_ == FollowGiftState::IDLE &&
+        feedbackMatches(feedback, "say", "instruct_follow_person") &&
+        isSuccessfulFeedback(feedback))
+    {
+      return dispatchFollowGiftListen(FollowGiftState::WAIT_INITIAL_ANSWER);
+    }
+
+    if (follow_gift_state_ == FollowGiftState::IDLE) {
+      return false;
+    }
+
+    switch (follow_gift_state_)
+    {
+      case FollowGiftState::WAIT_INITIAL_ANSWER:
+      {
+        // Primera respuesta del usuario:
+        // - stop: no se activa seguimiento; se entrega el paquete.
+        // - follow/continue: se activa seguimiento y luego se espera stop.
+        if (!feedbackMatches(feedback, "listen", "answer")) {
+          return false;
+        }
+
+        if (answerHasStop(feedback.worker_result)) {
+          return dispatchFollowGiftInstruction(
+            "Justina drop gift",
+            FollowGiftState::WAIT_DROP_GIFT);
+        }
+
+        if (isSuccessfulFeedback(feedback) &&
+            answerHasFollowOrContinue(feedback.worker_result))
+        {
+          return dispatchFollowGiftInstruction(
+            "Justina follow enable",
+            FollowGiftState::WAIT_FOLLOW_ENABLE);
+        }
+
+        return refreshFollowGiftListen(feedback.worker_result);
+      }
+
+      case FollowGiftState::WAIT_FOLLOW_ENABLE:
+      {
+        // Cuando el seguimiento ya quedo activo, se abre el ciclo de escucha
+        // hasta oir stop.
+        if (!feedbackMatches(feedback, "follow", "enable")) {
+          return false;
+        }
+
+        if (!isSuccessfulFeedback(feedback)) {
+          follow_gift_state_ = FollowGiftState::IDLE;
+          return false;
+        }
+
+        return dispatchFollowGiftListen(FollowGiftState::WAIT_STOP_ANSWER);
+      }
+
+      case FollowGiftState::WAIT_STOP_ANSWER:
+      {
+        // En esta fase solo stop cierra el ciclo; todo lo demas se ignora y
+        // refresca el listen.
+        if (!feedbackMatches(feedback, "listen", "answer")) {
+          return false;
+        }
+
+        if (answerHasStop(feedback.worker_result)) {
+          return dispatchFollowGiftInstruction(
+            "Justina follow disable",
+            FollowGiftState::WAIT_FOLLOW_DISABLE);
+        }
+
+        return refreshFollowGiftListen(feedback.worker_result);
+      }
+
+      case FollowGiftState::WAIT_FOLLOW_DISABLE:
+      {
+        // Al detener el seguimiento, se encadena la entrega del regalo.
+        if (!feedbackMatches(feedback, "follow", "disable")) {
+          return false;
+        }
+
+        if (!isSuccessfulFeedback(feedback)) {
+          follow_gift_state_ = FollowGiftState::IDLE;
+          return false;
+        }
+
+        return dispatchFollowGiftInstruction(
+          "Justina drop gift",
+          FollowGiftState::WAIT_DROP_GIFT);
+      }
+
+      case FollowGiftState::WAIT_DROP_GIFT:
+      {
+        // La secuencia dinamica termina despues de ejecutar drop gift; desde aqui
+        // el manager vuelve al flujo normal del plan.
+        if (!feedbackMatches(feedback, "drop", "gift")) {
+          return false;
+        }
+
+        follow_gift_state_ = FollowGiftState::IDLE;
+        return false;
+      }
+
+      case FollowGiftState::IDLE:
+      default:
+        return false;
+    }
   }
 
   bool needsApprovalRetry(const std::string & action) const
@@ -1356,6 +1564,11 @@ private:
           break;
         }
 
+        if (handleFollowGiftSequence(feedback))
+        {
+          break;
+        }
+
         if (!feedback.approved || isExecutionFailureStatus(feedback.status))
         {
           if (handleDataCaptureFailure(feedback)) {
@@ -1551,6 +1764,10 @@ private:
   bool door_retry_pending_{false};
   int door_open_request_count_{0};
   rclcpp::Time door_retry_time_{0, 0, RCL_ROS_TIME};
+
+  // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
+  // say instruct_follow_person -> listen answer -> follow/drop segun respuesta.
+  FollowGiftState follow_gift_state_{FollowGiftState::IDLE};
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
