@@ -20,6 +20,7 @@ find_package(clips_interfaces REQUIRED)
 find_package(known_locations_interfaces REQUIRED)
 find_package(listener_interfaces REQUIRED)
 find_package(talker_interfaces REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -47,6 +48,7 @@ ament_target_dependencies(supervisor_manager_node
   known_locations_interfaces
   listener_interfaces
   talker_interfaces
+  nlohmann_json
 )
 
 ament_target_dependencies(supervisor_goto_test_node
@@ -89,6 +91,7 @@ ament_export_dependencies(
   known_locations_interfaces
   listener_interfaces
   talker_interfaces
+  nlohmann_json
 )
 
 ament_package()

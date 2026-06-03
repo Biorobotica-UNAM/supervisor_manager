@@ -12,6 +12,8 @@
 #include <talker_interfaces/srv/talk.hpp>
 #include <planning_tools/Planning.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -148,9 +150,7 @@ private:
     // Sub-FSM local para el caso say instruct_follow_person
     // sin consumir pasos fijos del plan CLIPS.
     IDLE,
-    WAIT_INITIAL_ANSWER,
     WAIT_FOLLOW_ENABLE,
-    WAIT_STOP_ANSWER,
     WAIT_FOLLOW_DISABLE,
     WAIT_DROP_GIFT
   };
@@ -345,6 +345,49 @@ private:
     return semantic;
   }
 
+  bool jsonHasUnknownDestination(const nlohmann::json & value) const
+  {
+    if (value.is_object()) {
+      const auto destination = value.find("destination");
+      if (destination != value.end() && destination->is_string() &&
+          normalizeText(destination->get<std::string>()) == "unknown")
+      {
+        return true;
+      }
+
+      for (const auto & item : value.items()) {
+        if (jsonHasUnknownDestination(item.value())) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (value.is_array()) {
+      for (const auto & item : value) {
+        if (jsonHasUnknownDestination(item)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  bool semanticHasUnknownDestination(const std::string & semantic) const
+  {
+    try {
+      const auto parsed = nlohmann::json::parse(semantic);
+      return jsonHasUnknownDestination(parsed);
+    } catch (const nlohmann::json::exception & ex) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Step 2] Could not parse semantic JSON for destination validation: %s",
+        ex.what());
+      return false;
+    }
+  }
+
   std::string stepToClips(const std::string & semantic)
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] Converting to CLIPS: \"%s\"", semantic.c_str());
@@ -395,18 +438,34 @@ private:
       return false;
     }
 
-    std::string text;
+    std::string semantic;
     for (int retry = 0; retry <= MAX_NATURAL_LANGUAGE_LISTEN_RETRIES; ++retry) {
-      text = stepListen();
-      if (!text.empty()) {
-        break;
+      const std::string text = stepListen();
+      if (text.empty()) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "Pipeline listen attempt %d/%d failed",
+          retry + 1,
+          MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+      } else {
+        semantic = stepParse(text);
+        if (semantic.empty()) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "Pipeline semantic parse attempt %d/%d failed",
+            retry + 1,
+            MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+        } else if (semanticHasUnknownDestination(semantic)) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[Pipeline][Step 2] Semantic destination is unknown; asking for instruction again");
+          semantic.clear();
+        }
       }
 
-      RCLCPP_WARN(
-        this->get_logger(),
-        "Pipeline listen attempt %d/%d failed",
-        retry + 1,
-        MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+      if (!semantic.empty()) {
+        break;
+      }
 
       if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES && !askUserToRepeatCommand(retry + 1)) {
         RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: askUserToRepeatCommand failed");
@@ -414,18 +473,12 @@ private:
       }
     }
 
-    if (text.empty()) {
+    if (semantic.empty()) {
       RCLCPP_ERROR(
         this->get_logger(),
-        "Pipeline failed at step 1: Listen returned empty after %d retries",
+        "Pipeline failed before step 3: no valid command after %d retries",
         MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
       announceNaturalLanguageSequenceRestart();
-      return false;
-    }
-
-    const std::string semantic = stepParse(text);
-    if (semantic.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 2: parseSemanticCommand returned empty");
       return false;
     }
 
@@ -634,32 +687,87 @@ private:
            normalizeText(feedback.argument) == argument;
   }
 
-  bool answerHasStop(const std::string & worker_result) const
+  bool answerHasStop(const std::string & text) const
   {
-    // Listen SIMPLE devuelve algo como "answer=stop"; se busca la palabra clave
-    // dentro del resultado completo para tolerar variantes del worker.
-    return normalizeText(worker_result).find("stop") != std::string::npos;
+    return normalizeText(text).find("stop") != std::string::npos;
   }
 
-  bool answerHasFollowOrContinue(const std::string & worker_result) const
+  bool answerHasFollowOrContinue(const std::string & text) const
   {
-    // El primer listen acepta follow o continue como permiso para activar
+    // La primera respuesta acepta follow o continue como permiso para activar
     // seguimiento humano.
-    const std::string answer = normalizeText(worker_result);
+    const std::string answer = normalizeText(text);
     return answer.find("follow") != std::string::npos ||
            answer.find("continue") != std::string::npos;
   }
 
-  bool dispatchFollowGiftListen(FollowGiftState next_state)
+  std::string listenFollowGiftAnswer()
   {
-    // Mantiene el listen activo de forma reactiva: cada intento es una nueva
-    // instruccion "listen answer" disparada por el manager.
-    follow_gift_state_ = next_state;
+    // Escucha directa del manager: no inyecta "Justina listen answer" al plan,
+    // y evita depender de extractEntity(answer) en executor_tools/Listen.
+    if (!listener_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[FollowGift] Listen client not initialized");
+      return "";
+    }
+
+    if (!listener_client_->wait_for_service(1s)) {
+      RCLCPP_ERROR(this->get_logger(), "[FollowGift] Listen service unavailable");
+      return "";
+    }
+
+    auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
+    request->enable = true;
+    request->grammar = "";
+
+    auto future = listener_client_->async_send_request(request);
+    const auto status = future.wait_for(20s);
+    if (status != std::future_status::ready) {
+      RCLCPP_ERROR(this->get_logger(), "[FollowGift] Listen timeout");
+      return "";
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_WARN(this->get_logger(), "[FollowGift] No response received");
+      return "";
+    }
+
     RCLCPP_INFO(
       this->get_logger(),
-      "[FollowGift] dispatching listen answer; next_state=%u",
-      static_cast<unsigned int>(follow_gift_state_));
-    return dispatchOverrideInstruction("Justina listen answer");
+      "[FollowGift] Heard response: '%s'",
+      response->recognized_speech.c_str());
+    return response->recognized_speech;
+  }
+
+  std::string waitForFollowGiftAnswer(bool allow_follow_or_continue)
+  {
+    for (int attempt = 1; attempt <= MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS; ++attempt) {
+      if (attempt > 1) {
+        if (allow_follow_or_continue) {
+          sayText("I could not understand. Please say follow, continue, or stop.");
+        } else {
+          sayText("I could not understand. Please say stop when you want me to stop following.");
+        }
+      }
+
+      const std::string answer = listenFollowGiftAnswer();
+      if (answerHasStop(answer)) {
+        return "stop";
+      }
+
+      if (allow_follow_or_continue && answerHasFollowOrContinue(answer)) {
+        return "follow";
+      }
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[FollowGift] ignoring answer '%s' (attempt %d/%d)",
+        answer.c_str(),
+        attempt,
+        MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS);
+    }
+
+    return "";
   }
 
   bool dispatchFollowGiftInstruction(
@@ -675,17 +783,6 @@ private:
     return dispatchOverrideInstruction(instruction);
   }
 
-  bool refreshFollowGiftListen(const std::string & reason)
-  {
-    // Durante la espera de stop se descarta cualquier respuesta no util y se
-    // vuelve a escuchar sin avanzar al siguiente paso del plan.
-    RCLCPP_WARN(
-      this->get_logger(),
-      "[FollowGift] ignoring answer '%s'; listening again",
-      reason.c_str());
-    return dispatchFollowGiftListen(follow_gift_state_);
-  }
-
   bool handleFollowGiftSequence(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
@@ -695,7 +792,19 @@ private:
         feedbackMatches(feedback, "say", "instruct_follow_person") &&
         isSuccessfulFeedback(feedback))
     {
-      return dispatchFollowGiftListen(FollowGiftState::WAIT_INITIAL_ANSWER);
+      const std::string answer = waitForFollowGiftAnswer(true);
+      if (answer == "stop" || answer.empty()) {
+        if (answer.empty()) {
+          sayText("I could not understand the instruction. I will drop the gift here.");
+        }
+        return dispatchFollowGiftInstruction(
+          "Justina drop gift",
+          FollowGiftState::WAIT_DROP_GIFT);
+      }
+
+      return dispatchFollowGiftInstruction(
+        "Justina follow enable",
+        FollowGiftState::WAIT_FOLLOW_ENABLE);
     }
 
     if (follow_gift_state_ == FollowGiftState::IDLE) {
@@ -704,36 +813,10 @@ private:
 
     switch (follow_gift_state_)
     {
-      case FollowGiftState::WAIT_INITIAL_ANSWER:
-      {
-        // Primera respuesta del usuario:
-        // - stop: no se activa seguimiento; se entrega el paquete.
-        // - follow/continue: se activa seguimiento y luego se espera stop.
-        if (!feedbackMatches(feedback, "listen", "answer")) {
-          return false;
-        }
-
-        if (answerHasStop(feedback.worker_result)) {
-          return dispatchFollowGiftInstruction(
-            "Justina drop gift",
-            FollowGiftState::WAIT_DROP_GIFT);
-        }
-
-        if (isSuccessfulFeedback(feedback) &&
-            answerHasFollowOrContinue(feedback.worker_result))
-        {
-          return dispatchFollowGiftInstruction(
-            "Justina follow enable",
-            FollowGiftState::WAIT_FOLLOW_ENABLE);
-        }
-
-        return refreshFollowGiftListen(feedback.worker_result);
-      }
-
       case FollowGiftState::WAIT_FOLLOW_ENABLE:
       {
-        // Cuando el seguimiento ya quedo activo, se abre el ciclo de escucha
-        // hasta oir stop.
+        // Cuando el seguimiento ya quedo activo, el manager escucha directo
+        // hasta oir stop, sin inyectar listen al plan.
         if (!feedbackMatches(feedback, "follow", "enable")) {
           return false;
         }
@@ -743,24 +826,14 @@ private:
           return false;
         }
 
-        return dispatchFollowGiftListen(FollowGiftState::WAIT_STOP_ANSWER);
-      }
-
-      case FollowGiftState::WAIT_STOP_ANSWER:
-      {
-        // En esta fase solo stop cierra el ciclo; todo lo demas se ignora y
-        // refresca el listen.
-        if (!feedbackMatches(feedback, "listen", "answer")) {
-          return false;
+        const std::string answer = waitForFollowGiftAnswer(false);
+        if (answer.empty()) {
+          sayText("I could not hear stop clearly. I will stop following now.");
         }
 
-        if (answerHasStop(feedback.worker_result)) {
-          return dispatchFollowGiftInstruction(
-            "Justina follow disable",
-            FollowGiftState::WAIT_FOLLOW_DISABLE);
-        }
-
-        return refreshFollowGiftListen(feedback.worker_result);
+        return dispatchFollowGiftInstruction(
+          "Justina follow disable",
+          FollowGiftState::WAIT_FOLLOW_DISABLE);
       }
 
       case FollowGiftState::WAIT_FOLLOW_DISABLE:
@@ -1766,7 +1839,8 @@ private:
   rclcpp::Time door_retry_time_{0, 0, RCL_ROS_TIME};
 
   // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
-  // say instruct_follow_person -> listen answer -> follow/drop segun respuesta.
+  // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
+  static constexpr int MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS = 3;
   FollowGiftState follow_gift_state_{FollowGiftState::IDLE};
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
