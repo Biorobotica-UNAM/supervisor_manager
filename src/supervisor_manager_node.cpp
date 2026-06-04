@@ -794,6 +794,7 @@ private:
     {
       const std::string answer = waitForFollowGiftAnswer(true);
       if (answer == "stop") {
+        sayText("Understood. I am ready to leave the gift.");
         return dispatchFollowGiftInstruction(
           "Justina drop gift",
           FollowGiftState::WAIT_DROP_GIFT);
@@ -801,6 +802,10 @@ private:
 
       if (answer.empty()) {
         sayText("I could not understand the instruction. I will start following you.");
+      }
+
+      if (answer == "follow") {
+        sayText("Understood. I will start following you now.");
       }
 
       return dispatchFollowGiftInstruction(
@@ -830,6 +835,8 @@ private:
         const std::string answer = waitForFollowGiftAnswer(false);
         if (answer.empty()) {
           sayText("I could not hear stop clearly. I will stop following now.");
+        } else if (answer == "stop") {
+          sayText("Understood. I am ready to leave the gift.");
         }
 
         return dispatchFollowGiftInstruction(
