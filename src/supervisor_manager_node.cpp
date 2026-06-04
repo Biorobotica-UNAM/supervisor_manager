@@ -793,13 +793,14 @@ private:
         isSuccessfulFeedback(feedback))
     {
       const std::string answer = waitForFollowGiftAnswer(true);
-      if (answer == "stop" || answer.empty()) {
-        if (answer.empty()) {
-          sayText("I could not understand the instruction. I will drop the gift here.");
-        }
+      if (answer == "stop") {
         return dispatchFollowGiftInstruction(
           "Justina drop gift",
           FollowGiftState::WAIT_DROP_GIFT);
+      }
+
+      if (answer.empty()) {
+        sayText("I could not understand the instruction. I will start following you.");
       }
 
       return dispatchFollowGiftInstruction(
