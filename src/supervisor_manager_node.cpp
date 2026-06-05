@@ -12,17 +12,21 @@
 #include <talker_interfaces/srv/talk.hpp>
 #include <planning_tools/Planning.hpp>
 
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -155,6 +159,15 @@ private:
     WAIT_DROP_GIFT
   };
 
+  struct SemanticValidationResult
+  {
+    bool valid{true};
+    bool unknown_destination{false};
+    bool command_aborted{false};
+    std::string abort_reason;
+    std::vector<std::string> invalid_destinations;
+  };
+
   // ===== One-shot init =====
   void initToolsOnce()
   {
@@ -279,6 +292,34 @@ private:
     return sayText("I did not understand your command. Please repeat the instruction.");
   }
 
+  bool askUserToRepeatInvalidDestinationCommand(
+    const std::string & destination,
+    int attempt)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user to repeat command with valid destination, retry %d/%d...",
+      attempt,
+      MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
+    return sayText(
+      "I understood the command, but " + makeSpeechFriendly(destination) +
+      " is not a known destination. Please repeat the command.");
+  }
+
+  bool askUserForDifferentCommand(
+    const std::string & destination,
+    int attempt)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user for a different command, retry %d/%d...",
+      attempt,
+      MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
+    return sayText(
+      "That command cannot be performed because " + makeSpeechFriendly(destination) +
+      " is not a known destination. Please give me a different command.");
+  }
+
   void announceNaturalLanguageSequenceRestart()
   {
     RCLCPP_WARN(
@@ -345,47 +386,239 @@ private:
     return semantic;
   }
 
-  bool jsonHasUnknownDestination(const nlohmann::json & value) const
+  std::string normalizeKnowledgeToken(std::string value) const
+  {
+    std::transform(
+      value.begin(),
+      value.end(),
+      value.begin(),
+      [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+
+    const auto first = value.find_first_not_of(" \t\n\r");
+    if (first == std::string::npos) {
+      return "";
+    }
+
+    const auto last = value.find_last_not_of(" \t\n\r");
+    value = value.substr(first, last - first + 1);
+
+    std::replace(value.begin(), value.end(), ' ', '_');
+    std::replace(value.begin(), value.end(), '-', '_');
+    return value;
+  }
+
+  bool loadKnownLocations()
+  {
+    if (known_locations_loaded_) {
+      return !known_locations_.empty();
+    }
+
+    try {
+      const std::string bank_path =
+        ament_index_cpp::get_package_share_directory("knowledge_bank");
+      const std::string locations_path = bank_path + "/domains/locations.yaml";
+      const YAML::Node root = YAML::LoadFile(locations_path);
+
+      if (!root.IsMap()) {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "[Pipeline][Step 2] locations.yaml is not a map: %s",
+          locations_path.c_str());
+        known_locations_loaded_ = true;
+        return false;
+      }
+
+      for (const auto & category : root) {
+        if (category.first.IsScalar()) {
+          const std::string location = normalizeKnowledgeToken(category.first.as<std::string>());
+          if (!location.empty()) {
+            known_locations_.insert(location);
+          }
+        }
+
+        if (!category.second.IsSequence()) {
+          continue;
+        }
+
+        for (const auto & item : category.second) {
+          if (!item.IsScalar()) {
+            continue;
+          }
+
+          const std::string location = normalizeKnowledgeToken(item.as<std::string>());
+          if (!location.empty()) {
+            known_locations_.insert(location);
+          }
+        }
+      }
+
+      known_locations_loaded_ = true;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Pipeline][Step 2] Loaded %zu known destinations from %s",
+        known_locations_.size(),
+        locations_path.c_str());
+      return !known_locations_.empty();
+    } catch (const std::exception & ex) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[Pipeline][Step 2] Could not load knowledge_bank locations: %s",
+        ex.what());
+      known_locations_loaded_ = true;
+      return false;
+    }
+  }
+
+  bool isSpecialSemanticDestination(const std::string & destination) const
+  {
+    return destination == "unknown" ||
+           destination == "user" ||
+           destination == "person_recipient";
+  }
+
+  bool textMentionsUnknownDestination(const std::string & text) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(text);
+    return normalized.find("destination") != std::string::npos ||
+           normalized.find("location") != std::string::npos;
+  }
+
+  bool semanticLooksLikeAbortedCommand(const std::string & semantic) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(semantic);
+    return normalized.rfind("command_aborted", 0U) == 0U;
+  }
+
+  std::string commandAbortReasonFromText(const std::string & semantic) const
+  {
+    const std::size_t separator = semantic.find(':');
+    if (separator == std::string::npos || separator + 1 >= semantic.size()) {
+      return semantic;
+    }
+
+    const std::string reason = semantic.substr(separator + 1);
+    const auto first = reason.find_first_not_of(" \t\n\r");
+    if (first == std::string::npos) {
+      return "";
+    }
+
+    const auto last = reason.find_last_not_of(" \t\n\r");
+    return reason.substr(first, last - first + 1);
+  }
+
+  void markSemanticAbort(
+    SemanticValidationResult & result,
+    const std::string & reason) const
+  {
+    result.valid = false;
+    result.command_aborted = true;
+    result.abort_reason = reason;
+    if (textMentionsUnknownDestination(reason)) {
+      result.unknown_destination = true;
+    }
+  }
+
+  bool applySemanticAbortIfPresent(
+    const nlohmann::json & value,
+    SemanticValidationResult & result) const
+  {
+    if (!value.is_object()) {
+      return false;
+    }
+
+    const auto status = value.find("status");
+    if (status == value.end() || !status->is_string() ||
+        normalizeKnowledgeToken(status->get<std::string>()) != "aborted")
+    {
+      return false;
+    }
+
+    const auto reason = value.find("reason");
+    if (reason != value.end() && reason->is_string()) {
+      markSemanticAbort(result, reason->get<std::string>());
+    } else {
+      markSemanticAbort(result, "semantic parser aborted the command");
+    }
+
+    return true;
+  }
+
+  void validateJsonDestinations(
+    const nlohmann::json & value,
+    SemanticValidationResult & result)
   {
     if (value.is_object()) {
       const auto destination = value.find("destination");
-      if (destination != value.end() && destination->is_string() &&
-          normalizeText(destination->get<std::string>()) == "unknown")
-      {
-        return true;
+      if (destination != value.end() && destination->is_string()) {
+        const std::string raw_destination = destination->get<std::string>();
+        const std::string normalized_destination = normalizeKnowledgeToken(raw_destination);
+
+        if (normalized_destination == "unknown") {
+          result.valid = false;
+          result.unknown_destination = true;
+        } else if (!known_locations_.empty() &&
+                   !isSpecialSemanticDestination(normalized_destination) &&
+                   known_locations_.find(normalized_destination) == known_locations_.end())
+        {
+          result.valid = false;
+          result.invalid_destinations.push_back(raw_destination);
+        }
       }
 
       for (const auto & item : value.items()) {
-        if (jsonHasUnknownDestination(item.value())) {
-          return true;
-        }
+        validateJsonDestinations(item.value(), result);
       }
-      return false;
+      return;
     }
 
     if (value.is_array()) {
       for (const auto & item : value) {
-        if (jsonHasUnknownDestination(item)) {
-          return true;
-        }
+        validateJsonDestinations(item, result);
       }
     }
-
-    return false;
   }
 
-  bool semanticHasUnknownDestination(const std::string & semantic) const
+  SemanticValidationResult validateSemanticDestinations(const std::string & semantic)
   {
+    SemanticValidationResult result;
+
+    if (semanticLooksLikeAbortedCommand(semantic)) {
+      markSemanticAbort(result, commandAbortReasonFromText(semantic));
+      return result;
+    }
+
     try {
       const auto parsed = nlohmann::json::parse(semantic);
-      return jsonHasUnknownDestination(parsed);
+      if (applySemanticAbortIfPresent(parsed, result)) {
+        return result;
+      }
+
+      const bool can_validate_locations = loadKnownLocations();
+      validateJsonDestinations(parsed, result);
+
+      if (!can_validate_locations) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[Pipeline][Step 2] Destination domain unavailable; semantic destination validation is partial");
+      }
     } catch (const nlohmann::json::exception & ex) {
       RCLCPP_WARN(
         this->get_logger(),
         "[Pipeline][Step 2] Could not parse semantic JSON for destination validation: %s",
         ex.what());
-      return false;
+      markSemanticAbort(result, "semantic parser returned a non JSON response");
     }
+
+    return result;
+  }
+
+  std::string firstInvalidDestination(const SemanticValidationResult & validation) const
+  {
+    if (validation.invalid_destinations.empty()) {
+      return "the requested place";
+    }
+
+    return validation.invalid_destinations.front();
   }
 
   std::string stepToClips(const std::string & semantic)
@@ -439,7 +672,12 @@ private:
     }
 
     std::string semantic;
+    int invalid_destination_attempts = 0;
     for (int retry = 0; retry <= MAX_NATURAL_LANGUAGE_LISTEN_RETRIES; ++retry) {
+      enum class RetryPrompt : uint8_t {RepeatCommand, RepeatInvalidDestination, DifferentCommand};
+      RetryPrompt retry_prompt = RetryPrompt::RepeatCommand;
+      std::string invalid_destination;
+
       const std::string text = stepListen();
       if (text.empty()) {
         RCLCPP_WARN(
@@ -455,11 +693,39 @@ private:
             "Pipeline semantic parse attempt %d/%d failed",
             retry + 1,
             MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
-        } else if (semanticHasUnknownDestination(semantic)) {
-          RCLCPP_WARN(
-            this->get_logger(),
-            "[Pipeline][Step 2] Semantic destination is unknown; asking for instruction again");
-          semantic.clear();
+        } else {
+          const SemanticValidationResult validation = validateSemanticDestinations(semantic);
+          if (!validation.valid) {
+            if (validation.command_aborted) {
+              RCLCPP_WARN(
+                this->get_logger(),
+                "[Pipeline][Step 2] Semantic parser aborted command: %s",
+                validation.abort_reason.empty()
+                  ? "unknown validation error"
+                  : validation.abort_reason.c_str());
+            }
+
+            if (validation.unknown_destination) {
+              RCLCPP_WARN(
+                this->get_logger(),
+                "[Pipeline][Step 2] Semantic destination is unknown; asking for instruction again");
+            }
+
+            if (!validation.invalid_destinations.empty()) {
+              ++invalid_destination_attempts;
+              invalid_destination = firstInvalidDestination(validation);
+              retry_prompt = invalid_destination_attempts >= 2
+                ? RetryPrompt::DifferentCommand
+                : RetryPrompt::RepeatInvalidDestination;
+              RCLCPP_WARN(
+                this->get_logger(),
+                "[Pipeline][Step 2] Semantic destination '%s' is not in knowledge_bank/domains/locations.yaml; attempt %d",
+                invalid_destination.c_str(),
+                invalid_destination_attempts);
+            }
+
+            semantic.clear();
+          }
         }
       }
 
@@ -467,9 +733,29 @@ private:
         break;
       }
 
-      if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES && !askUserToRepeatCommand(retry + 1)) {
-        RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: askUserToRepeatCommand failed");
-        return false;
+      if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES) {
+        bool prompt_ok = false;
+        switch (retry_prompt) {
+          case RetryPrompt::RepeatInvalidDestination:
+            prompt_ok = askUserToRepeatInvalidDestinationCommand(
+              invalid_destination,
+              retry + 1);
+            break;
+          case RetryPrompt::DifferentCommand:
+            prompt_ok = askUserForDifferentCommand(
+              invalid_destination,
+              retry + 1);
+            break;
+          case RetryPrompt::RepeatCommand:
+          default:
+            prompt_ok = askUserToRepeatCommand(retry + 1);
+            break;
+        }
+
+        if (!prompt_ok) {
+          RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: retry prompt failed");
+          return false;
+        }
       }
     }
 
@@ -1818,6 +2104,8 @@ private:
   bool natural_language_planning_{false};
   static constexpr int MAX_NATURAL_LANGUAGE_LISTEN_RETRIES = 3;
   bool at_instruction_point_{false};
+  bool known_locations_loaded_{false};
+  std::unordered_set<std::string> known_locations_;
 
   // FSM
   State state_{State::SM_INIT};

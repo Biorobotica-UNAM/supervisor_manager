@@ -14,6 +14,7 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>actionlib_msgs</depend>
+  <depend>ament_index_cpp</depend>
 
   <depend>executor_interfaces</depend>
   <depend>supervisor_interfaces</depend>
@@ -22,6 +23,10 @@
   <depend>known_locations_interfaces</depend>
   <depend>listener_interfaces</depend>
   <depend>talker_interfaces</depend>
+  <depend>nlohmann_json</depend>
+  <depend>yaml-cpp</depend>
+
+  <exec_depend>knowledge_bank</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
