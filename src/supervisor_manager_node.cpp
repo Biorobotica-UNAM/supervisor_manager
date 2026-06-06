@@ -349,7 +349,7 @@ private:
     request->grammar = "";
 
     auto future = listener_client_->async_send_request(request);
-    const auto status = future.wait_for(20s);
+    const auto status = future.wait_for(10s);
     if (status != std::future_status::ready) {
       RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 1] Listen timeout");
       return "";
