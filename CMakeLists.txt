@@ -32,8 +32,6 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(supervisor_manager_node src/supervisor_manager_node.cpp)
-add_executable(supervisor_goto_test_node src/supervisor_goto_test_node.cpp)
-add_executable(supervisor_test_node src/supervisor_test_node.cpp)
 
 target_include_directories(supervisor_manager_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -58,24 +56,8 @@ target_link_libraries(supervisor_manager_node
   yaml-cpp
 )
 
-ament_target_dependencies(supervisor_goto_test_node
-  rclcpp
-  rclcpp_action
-  std_msgs
-  actionlib_msgs
-  executor_interfaces
-)
-
-ament_target_dependencies(supervisor_test_node
-  rclcpp
-  rclcpp_action
-  executor_interfaces
-)
-
 install(TARGETS
   supervisor_manager_node
-  supervisor_goto_test_node
-  supervisor_test_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
