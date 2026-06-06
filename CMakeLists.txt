@@ -12,6 +12,7 @@ find_package(rclcpp_action REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(actionlib_msgs REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 
 find_package(executor_interfaces REQUIRED)
 find_package(supervisor_interfaces REQUIRED)
@@ -20,6 +21,8 @@ find_package(clips_interfaces REQUIRED)
 find_package(known_locations_interfaces REQUIRED)
 find_package(listener_interfaces REQUIRED)
 find_package(talker_interfaces REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -44,9 +47,15 @@ ament_target_dependencies(supervisor_manager_node
   supervisor_interfaces
   clips_interfaces
   planning_tools
+  ament_index_cpp
   known_locations_interfaces
   listener_interfaces
   talker_interfaces
+  nlohmann_json
+)
+
+target_link_libraries(supervisor_manager_node
+  yaml-cpp
 )
 
 ament_target_dependencies(supervisor_goto_test_node
@@ -86,9 +95,11 @@ ament_export_dependencies(
   supervisor_interfaces
   clips_interfaces
   planning_tools
+  ament_index_cpp
   known_locations_interfaces
   listener_interfaces
   talker_interfaces
+  nlohmann_json
 )
 
 ament_package()

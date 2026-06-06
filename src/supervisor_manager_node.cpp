@@ -12,15 +12,21 @@
 #include <talker_interfaces/srv/talk.hpp>
 #include <planning_tools/Planning.hpp>
 
+#include <ament_index_cpp/get_package_share_directory.hpp>
+#include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -141,6 +147,25 @@ private:
     SM_WAIT_EXECUTION_RESULT,
 
     SM_FINISH
+  };
+
+  enum class FollowGiftState : uint8_t
+  {
+    // Sub-FSM local para el caso say instruct_follow_person
+    // sin consumir pasos fijos del plan CLIPS.
+    IDLE,
+    WAIT_FOLLOW_ENABLE,
+    WAIT_FOLLOW_DISABLE,
+    WAIT_DROP_GIFT
+  };
+
+  struct SemanticValidationResult
+  {
+    bool valid{true};
+    bool unknown_destination{false};
+    bool command_aborted{false};
+    std::string abort_reason;
+    std::vector<std::string> invalid_destinations;
   };
 
   // ===== One-shot init =====
@@ -267,6 +292,34 @@ private:
     return sayText("I did not understand your command. Please repeat the instruction.");
   }
 
+  bool askUserToRepeatInvalidDestinationCommand(
+    const std::string & destination,
+    int attempt)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user to repeat command with valid destination, retry %d/%d...",
+      attempt,
+      MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
+    return sayText(
+      "I understood the command, but " + makeSpeechFriendly(destination) +
+      " is not a known destination. Please repeat the command.");
+  }
+
+  bool askUserForDifferentCommand(
+    const std::string & destination,
+    int attempt)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user for a different command, retry %d/%d...",
+      attempt,
+      MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
+    return sayText(
+      "That command cannot be performed because " + makeSpeechFriendly(destination) +
+      " is not a known destination. Please give me a different command.");
+  }
+
   void announceNaturalLanguageSequenceRestart()
   {
     RCLCPP_WARN(
@@ -333,6 +386,241 @@ private:
     return semantic;
   }
 
+  std::string normalizeKnowledgeToken(std::string value) const
+  {
+    std::transform(
+      value.begin(),
+      value.end(),
+      value.begin(),
+      [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+
+    const auto first = value.find_first_not_of(" \t\n\r");
+    if (first == std::string::npos) {
+      return "";
+    }
+
+    const auto last = value.find_last_not_of(" \t\n\r");
+    value = value.substr(first, last - first + 1);
+
+    std::replace(value.begin(), value.end(), ' ', '_');
+    std::replace(value.begin(), value.end(), '-', '_');
+    return value;
+  }
+
+  bool loadKnownLocations()
+  {
+    if (known_locations_loaded_) {
+      return !known_locations_.empty();
+    }
+
+    try {
+      const std::string bank_path =
+        ament_index_cpp::get_package_share_directory("knowledge_bank");
+      const std::string locations_path = bank_path + "/domains/locations.yaml";
+      const YAML::Node root = YAML::LoadFile(locations_path);
+
+      if (!root.IsMap()) {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "[Pipeline][Step 2] locations.yaml is not a map: %s",
+          locations_path.c_str());
+        known_locations_loaded_ = true;
+        return false;
+      }
+
+      for (const auto & category : root) {
+        if (category.first.IsScalar()) {
+          const std::string location = normalizeKnowledgeToken(category.first.as<std::string>());
+          if (!location.empty()) {
+            known_locations_.insert(location);
+          }
+        }
+
+        if (!category.second.IsSequence()) {
+          continue;
+        }
+
+        for (const auto & item : category.second) {
+          if (!item.IsScalar()) {
+            continue;
+          }
+
+          const std::string location = normalizeKnowledgeToken(item.as<std::string>());
+          if (!location.empty()) {
+            known_locations_.insert(location);
+          }
+        }
+      }
+
+      known_locations_loaded_ = true;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Pipeline][Step 2] Loaded %zu known destinations from %s",
+        known_locations_.size(),
+        locations_path.c_str());
+      return !known_locations_.empty();
+    } catch (const std::exception & ex) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[Pipeline][Step 2] Could not load knowledge_bank locations: %s",
+        ex.what());
+      known_locations_loaded_ = true;
+      return false;
+    }
+  }
+
+  bool isSpecialSemanticDestination(const std::string & destination) const
+  {
+    return destination == "unknown" ||
+           destination == "user" ||
+           destination == "person_recipient";
+  }
+
+  bool textMentionsUnknownDestination(const std::string & text) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(text);
+    return normalized.find("destination") != std::string::npos ||
+           normalized.find("location") != std::string::npos;
+  }
+
+  bool semanticLooksLikeAbortedCommand(const std::string & semantic) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(semantic);
+    return normalized.rfind("command_aborted", 0U) == 0U;
+  }
+
+  std::string commandAbortReasonFromText(const std::string & semantic) const
+  {
+    const std::size_t separator = semantic.find(':');
+    if (separator == std::string::npos || separator + 1 >= semantic.size()) {
+      return semantic;
+    }
+
+    const std::string reason = semantic.substr(separator + 1);
+    const auto first = reason.find_first_not_of(" \t\n\r");
+    if (first == std::string::npos) {
+      return "";
+    }
+
+    const auto last = reason.find_last_not_of(" \t\n\r");
+    return reason.substr(first, last - first + 1);
+  }
+
+  void markSemanticAbort(
+    SemanticValidationResult & result,
+    const std::string & reason) const
+  {
+    result.valid = false;
+    result.command_aborted = true;
+    result.abort_reason = reason;
+    if (textMentionsUnknownDestination(reason)) {
+      result.unknown_destination = true;
+    }
+  }
+
+  bool applySemanticAbortIfPresent(
+    const nlohmann::json & value,
+    SemanticValidationResult & result) const
+  {
+    if (!value.is_object()) {
+      return false;
+    }
+
+    const auto status = value.find("status");
+    if (status == value.end() || !status->is_string() ||
+        normalizeKnowledgeToken(status->get<std::string>()) != "aborted")
+    {
+      return false;
+    }
+
+    const auto reason = value.find("reason");
+    if (reason != value.end() && reason->is_string()) {
+      markSemanticAbort(result, reason->get<std::string>());
+    } else {
+      markSemanticAbort(result, "semantic parser aborted the command");
+    }
+
+    return true;
+  }
+
+  void validateJsonDestinations(
+    const nlohmann::json & value,
+    SemanticValidationResult & result)
+  {
+    if (value.is_object()) {
+      const auto destination = value.find("destination");
+      if (destination != value.end() && destination->is_string()) {
+        const std::string raw_destination = destination->get<std::string>();
+        const std::string normalized_destination = normalizeKnowledgeToken(raw_destination);
+
+        if (normalized_destination == "unknown") {
+          result.valid = false;
+          result.unknown_destination = true;
+        } else if (!known_locations_.empty() &&
+                   !isSpecialSemanticDestination(normalized_destination) &&
+                   known_locations_.find(normalized_destination) == known_locations_.end())
+        {
+          result.valid = false;
+          result.invalid_destinations.push_back(raw_destination);
+        }
+      }
+
+      for (const auto & item : value.items()) {
+        validateJsonDestinations(item.value(), result);
+      }
+      return;
+    }
+
+    if (value.is_array()) {
+      for (const auto & item : value) {
+        validateJsonDestinations(item, result);
+      }
+    }
+  }
+
+  SemanticValidationResult validateSemanticDestinations(const std::string & semantic)
+  {
+    SemanticValidationResult result;
+
+    if (semanticLooksLikeAbortedCommand(semantic)) {
+      markSemanticAbort(result, commandAbortReasonFromText(semantic));
+      return result;
+    }
+
+    try {
+      const auto parsed = nlohmann::json::parse(semantic);
+      if (applySemanticAbortIfPresent(parsed, result)) {
+        return result;
+      }
+
+      const bool can_validate_locations = loadKnownLocations();
+      validateJsonDestinations(parsed, result);
+
+      if (!can_validate_locations) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[Pipeline][Step 2] Destination domain unavailable; semantic destination validation is partial");
+      }
+    } catch (const nlohmann::json::exception & ex) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Step 2] Could not parse semantic JSON for destination validation: %s",
+        ex.what());
+      markSemanticAbort(result, "semantic parser returned a non JSON response");
+    }
+
+    return result;
+  }
+
+  std::string firstInvalidDestination(const SemanticValidationResult & validation) const
+  {
+    if (validation.invalid_destinations.empty()) {
+      return "the requested place";
+    }
+
+    return validation.invalid_destinations.front();
+  }
+
   std::string stepToClips(const std::string & semantic)
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] Converting to CLIPS: \"%s\"", semantic.c_str());
@@ -383,37 +671,100 @@ private:
       return false;
     }
 
-    std::string text;
+    std::string semantic;
+    int invalid_destination_attempts = 0;
     for (int retry = 0; retry <= MAX_NATURAL_LANGUAGE_LISTEN_RETRIES; ++retry) {
-      text = stepListen();
-      if (!text.empty()) {
+      enum class RetryPrompt : uint8_t {RepeatCommand, RepeatInvalidDestination, DifferentCommand};
+      RetryPrompt retry_prompt = RetryPrompt::RepeatCommand;
+      std::string invalid_destination;
+
+      const std::string text = stepListen();
+      if (text.empty()) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "Pipeline listen attempt %d/%d failed",
+          retry + 1,
+          MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+      } else {
+        semantic = stepParse(text);
+        if (semantic.empty()) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "Pipeline semantic parse attempt %d/%d failed",
+            retry + 1,
+            MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+        } else {
+          const SemanticValidationResult validation = validateSemanticDestinations(semantic);
+          if (!validation.valid) {
+            if (validation.command_aborted) {
+              RCLCPP_WARN(
+                this->get_logger(),
+                "[Pipeline][Step 2] Semantic parser aborted command: %s",
+                validation.abort_reason.empty()
+                  ? "unknown validation error"
+                  : validation.abort_reason.c_str());
+            }
+
+            if (validation.unknown_destination) {
+              RCLCPP_WARN(
+                this->get_logger(),
+                "[Pipeline][Step 2] Semantic destination is unknown; asking for instruction again");
+            }
+
+            if (!validation.invalid_destinations.empty()) {
+              ++invalid_destination_attempts;
+              invalid_destination = firstInvalidDestination(validation);
+              retry_prompt = invalid_destination_attempts >= 2
+                ? RetryPrompt::DifferentCommand
+                : RetryPrompt::RepeatInvalidDestination;
+              RCLCPP_WARN(
+                this->get_logger(),
+                "[Pipeline][Step 2] Semantic destination '%s' is not in knowledge_bank/domains/locations.yaml; attempt %d",
+                invalid_destination.c_str(),
+                invalid_destination_attempts);
+            }
+
+            semantic.clear();
+          }
+        }
+      }
+
+      if (!semantic.empty()) {
         break;
       }
 
-      RCLCPP_WARN(
-        this->get_logger(),
-        "Pipeline listen attempt %d/%d failed",
-        retry + 1,
-        MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+      if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES) {
+        bool prompt_ok = false;
+        switch (retry_prompt) {
+          case RetryPrompt::RepeatInvalidDestination:
+            prompt_ok = askUserToRepeatInvalidDestinationCommand(
+              invalid_destination,
+              retry + 1);
+            break;
+          case RetryPrompt::DifferentCommand:
+            prompt_ok = askUserForDifferentCommand(
+              invalid_destination,
+              retry + 1);
+            break;
+          case RetryPrompt::RepeatCommand:
+          default:
+            prompt_ok = askUserToRepeatCommand(retry + 1);
+            break;
+        }
 
-      if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES && !askUserToRepeatCommand(retry + 1)) {
-        RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: askUserToRepeatCommand failed");
-        return false;
+        if (!prompt_ok) {
+          RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: retry prompt failed");
+          return false;
+        }
       }
     }
 
-    if (text.empty()) {
+    if (semantic.empty()) {
       RCLCPP_ERROR(
         this->get_logger(),
-        "Pipeline failed at step 1: Listen returned empty after %d retries",
+        "Pipeline failed before step 3: no valid command after %d retries",
         MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
       announceNaturalLanguageSequenceRestart();
-      return false;
-    }
-
-    const std::string semantic = stepParse(text);
-    if (semantic.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 2: parseSemanticCommand returned empty");
       return false;
     }
 
@@ -588,6 +939,230 @@ private:
     std_msgs::msg::Int32 msg;
     msg.data = 1;
     instruction_cmd_pub_->publish(msg);
+  }
+
+  void publishOverrideInstruction(const std::string & instruction)
+  {
+    // Inyecta una instruccion temporal en supervisor_plan. Esa instruccion se
+    // ejecuta antes del siguiente paso normal del plan.
+    std_msgs::msg::String inj;
+    inj.data = instruction;
+    corrective_instruction_pub_->publish(inj);
+  }
+
+  bool dispatchOverrideInstruction(const std::string & instruction)
+  {
+    // Publica el override y libera exactamente un ciclo plan->executor.
+    publishOverrideInstruction(instruction);
+    return publishAllowNextCycle();
+  }
+
+  bool isSuccessfulFeedback(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return feedback.approved &&
+           feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS;
+  }
+
+  bool feedbackMatches(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback,
+    const std::string & action,
+    const std::string & argument) const
+  {
+    return normalizeText(feedback.action) == action &&
+           normalizeText(feedback.argument) == argument;
+  }
+
+  bool answerHasStop(const std::string & text) const
+  {
+    return normalizeText(text).find("stop") != std::string::npos;
+  }
+
+  bool answerHasFollowOrContinue(const std::string & text) const
+  {
+    // La primera respuesta acepta follow o continue como permiso para activar
+    // seguimiento humano.
+    const std::string answer = normalizeText(text);
+    return answer.find("follow") != std::string::npos ||
+           answer.find("continue") != std::string::npos;
+  }
+
+  std::string listenFollowGiftAnswer()
+  {
+    // Escucha directa del manager: no inyecta "Justina listen answer" al plan,
+    // y evita depender de extractEntity(answer) en executor_tools/Listen.
+    if (!listener_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[FollowGift] Listen client not initialized");
+      return "";
+    }
+
+    if (!listener_client_->wait_for_service(1s)) {
+      RCLCPP_ERROR(this->get_logger(), "[FollowGift] Listen service unavailable");
+      return "";
+    }
+
+    auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
+    request->enable = true;
+    request->grammar = "";
+
+    auto future = listener_client_->async_send_request(request);
+    const auto status = future.wait_for(20s);
+    if (status != std::future_status::ready) {
+      RCLCPP_ERROR(this->get_logger(), "[FollowGift] Listen timeout");
+      return "";
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_WARN(this->get_logger(), "[FollowGift] No response received");
+      return "";
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[FollowGift] Heard response: '%s'",
+      response->recognized_speech.c_str());
+    return response->recognized_speech;
+  }
+
+  std::string waitForFollowGiftAnswer(bool allow_follow_or_continue)
+  {
+    for (int attempt = 1; attempt <= MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS; ++attempt) {
+      if (attempt > 1) {
+        if (allow_follow_or_continue) {
+          sayText("I could not understand. Please say follow, continue, or stop.");
+        } else {
+          sayText("I could not understand. Please say stop when you want me to stop following.");
+        }
+      }
+
+      const std::string answer = listenFollowGiftAnswer();
+      if (answerHasStop(answer)) {
+        return "stop";
+      }
+
+      if (allow_follow_or_continue && answerHasFollowOrContinue(answer)) {
+        return "follow";
+      }
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[FollowGift] ignoring answer '%s' (attempt %d/%d)",
+        answer.c_str(),
+        attempt,
+        MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS);
+    }
+
+    return "";
+  }
+
+  bool dispatchFollowGiftInstruction(
+    const std::string & instruction,
+    FollowGiftState next_state)
+  {
+    follow_gift_state_ = next_state;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[FollowGift] dispatching '%s'; next_state=%u",
+      instruction.c_str(),
+      static_cast<unsigned int>(follow_gift_state_));
+    return dispatchOverrideInstruction(instruction);
+  }
+
+  bool handleFollowGiftSequence(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Punto de entrada: cuando termina "say instruct_follow_person", el plan deja
+    // el control al manager para decidir dinamicamente segun lo que escuche.
+    if (follow_gift_state_ == FollowGiftState::IDLE &&
+        feedbackMatches(feedback, "say", "instruct_follow_person") &&
+        isSuccessfulFeedback(feedback))
+    {
+      const std::string answer = waitForFollowGiftAnswer(true);
+      if (answer == "stop") {
+        sayText("Understood. I am ready to leave the gift.");
+        return dispatchFollowGiftInstruction(
+          "Justina drop gift",
+          FollowGiftState::WAIT_DROP_GIFT);
+      }
+
+      if (answer.empty()) {
+        sayText("I could not understand the instruction. I will start following you.");
+      }
+
+      if (answer == "follow") {
+        sayText("Understood. I will start following you now.");
+      }
+
+      return dispatchFollowGiftInstruction(
+        "Justina follow enable",
+        FollowGiftState::WAIT_FOLLOW_ENABLE);
+    }
+
+    if (follow_gift_state_ == FollowGiftState::IDLE) {
+      return false;
+    }
+
+    switch (follow_gift_state_)
+    {
+      case FollowGiftState::WAIT_FOLLOW_ENABLE:
+      {
+        // Cuando el seguimiento ya quedo activo, el manager escucha directo
+        // hasta oir stop, sin inyectar listen al plan.
+        if (!feedbackMatches(feedback, "follow", "enable")) {
+          return false;
+        }
+
+        if (!isSuccessfulFeedback(feedback)) {
+          follow_gift_state_ = FollowGiftState::IDLE;
+          return false;
+        }
+
+        const std::string answer = waitForFollowGiftAnswer(false);
+        if (answer.empty()) {
+          sayText("I could not hear stop clearly. I will stop following now.");
+        } else if (answer == "stop") {
+          sayText("Understood. I am ready to leave the gift.");
+        }
+
+        return dispatchFollowGiftInstruction(
+          "Justina follow disable",
+          FollowGiftState::WAIT_FOLLOW_DISABLE);
+      }
+
+      case FollowGiftState::WAIT_FOLLOW_DISABLE:
+      {
+        // Al detener el seguimiento, se encadena la entrega del regalo.
+        if (!feedbackMatches(feedback, "follow", "disable")) {
+          return false;
+        }
+
+        if (!isSuccessfulFeedback(feedback)) {
+          follow_gift_state_ = FollowGiftState::IDLE;
+          return false;
+        }
+
+        return dispatchFollowGiftInstruction(
+          "Justina drop gift",
+          FollowGiftState::WAIT_DROP_GIFT);
+      }
+
+      case FollowGiftState::WAIT_DROP_GIFT:
+      {
+        // La secuencia dinamica termina despues de ejecutar drop gift; desde aqui
+        // el manager vuelve al flujo normal del plan.
+        if (!feedbackMatches(feedback, "drop", "gift")) {
+          return false;
+        }
+
+        follow_gift_state_ = FollowGiftState::IDLE;
+        return false;
+      }
+
+      case FollowGiftState::IDLE:
+      default:
+        return false;
+    }
   }
 
   bool needsApprovalRetry(const std::string & action) const
@@ -1356,6 +1931,11 @@ private:
           break;
         }
 
+        if (handleFollowGiftSequence(feedback))
+        {
+          break;
+        }
+
         if (!feedback.approved || isExecutionFailureStatus(feedback.status))
         {
           if (handleDataCaptureFailure(feedback)) {
@@ -1524,6 +2104,8 @@ private:
   bool natural_language_planning_{false};
   static constexpr int MAX_NATURAL_LANGUAGE_LISTEN_RETRIES = 3;
   bool at_instruction_point_{false};
+  bool known_locations_loaded_{false};
+  std::unordered_set<std::string> known_locations_;
 
   // FSM
   State state_{State::SM_INIT};
@@ -1551,6 +2133,11 @@ private:
   bool door_retry_pending_{false};
   int door_open_request_count_{0};
   rclcpp::Time door_retry_time_{0, 0, RCL_ROS_TIME};
+
+  // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
+  // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
+  static constexpr int MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS = 3;
+  FollowGiftState follow_gift_state_{FollowGiftState::IDLE};
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
