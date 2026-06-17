@@ -1263,6 +1263,10 @@ private:
       return "I understood your drink is " + value + ". Is that correct?";
     }
 
+    if (attribute == "order") {
+      return "I understood your order is " + value + ". Is that correct?";
+    }
+
     return "I understood " + attribute + " as " + value + ". Is that correct?";
   }
 
@@ -1736,8 +1740,10 @@ private:
     // Instrucciones correctivas para fallos de escucha. El objetivo es decir
     // algo antes de repetir la instruccion original.
     if (action == "listen") {
-      if (argument == "name")     return "Justina say repeat_name";
-      if (argument == "drink")    return "Justina say repeat_drink";
+      const std::string attribute = listenAttributeFromArgument(argument);
+      if (attribute == "name")     return "Justina say repeat_name";
+      if (attribute == "drink")    return "Justina say repeat_drink";
+      if (attribute == "order")    return "Justina say repeat_order";
       return "Justina say please_repeat";   // fallback genérico
     }
     return "";
