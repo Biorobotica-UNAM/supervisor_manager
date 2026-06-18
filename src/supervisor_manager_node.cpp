@@ -1697,6 +1697,75 @@ private:
     return makeSpeechFriendly(fallback_reason);
   }
 
+  bool isTakeAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "take";
+  }
+
+  bool isJustinaTakeInstruction(const std::string & instruction) const
+  {
+    const std::string normalized = normalizeText(instruction);
+    return normalized.rfind("justina take ", 0U) == 0U;
+  }
+
+  std::string takeRetryInstructionKey(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    const std::string current_instruction = getCurrentInstruction();
+    if (isJustinaTakeInstruction(current_instruction)) {
+      return current_instruction;
+    }
+
+    if (isTakeAction(feedback) && !feedback.argument.empty()) {
+      return "Justina take " + feedback.argument;
+    }
+
+    return "";
+  }
+
+  bool handleTakeFailureRetry(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (!isTakeAction(feedback)) {
+      return false;
+    }
+
+    const std::string instruction_key = takeRetryInstructionKey(feedback);
+    if (instruction_key.empty()) {
+      return false;
+    }
+
+    const std::string normalized_key = normalizeText(instruction_key);
+    if (take_retry_pending_ && normalizeText(take_retry_instruction_) == normalized_key) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakeRetry] Retry also failed for '%s'; continuing with normal failure path",
+        instruction_key.c_str());
+      take_retry_pending_ = false;
+      take_retry_instruction_.clear();
+      return false;
+    }
+
+    take_retry_pending_ = true;
+    take_retry_instruction_ = instruction_key;
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[TakeRetry] Retrying failed take instruction once: '%s'",
+      take_retry_instruction_.c_str());
+
+    if (!sayText("I will try once more.")) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakeRetry] could not announce take retry through TTS");
+    }
+
+    publishRetryCommand();
+    publishAllowNextCycle();
+    return true;
+  }
+
   void announceFailureAndContinue(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback,
     const std::string & reason)
@@ -1716,18 +1785,18 @@ private:
       knows_plan_state ? "true" : "false",
       active_plan ? "true" : "false");
 
-    std::string spoken = "I could not complete action " + makeSpeechFriendly(feedback.action);
+    std::string spoken = makeSpeechFriendly(feedback.action);
     if (!feedback.argument.empty()) {
       spoken += " " + makeSpeechFriendly(feedback.argument);
     }
-    spoken += " because " + failureReasonForSpeech(feedback, reason) + ".";
+    spoken += " failed: " + failureReasonForSpeech(feedback, reason) + ".";
 
     // Si supervisor_plan ya reporto que no quedan instrucciones, no prometemos
     // un siguiente paso ni disparamos otro ciclo de ejecucion.
     if (knows_plan_state && !active_plan) {
-      spoken += " There are no more steps in the plan.";
+      spoken += " No more steps.";
     } else {
-      spoken += " I will continue with the next step.";
+      spoken += " Next step.";
     }
 
     if (!sayText(spoken)) {
@@ -1979,6 +2048,7 @@ private:
               feedback.worker_result.c_str());
             publishRetryCommand();
             publishAllowNextCycle();
+          if (handleTakeFailureRetry(feedback)) {
             break;
           }
 
@@ -2025,6 +2095,11 @@ private:
         if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
           nav_retry_count_ = 0;
+          if (isTakeAction(feedback)) {
+            take_retry_pending_ = false;
+            take_retry_instruction_.clear();
+          }
+
           updateInstructionPointStateFromGoTo(feedback);
 
           if (door_waiting_active_ && isDoorOpenCheckSuccess(feedback)) {
@@ -2178,6 +2253,9 @@ private:
   // Conteo de reintentos de navegacion (go_to). Se resetea al exito.
   // Solo un bumper activo acepta detener la navegacion permanentemente.
   int nav_retry_count_{0};
+  // Reintento unico para "Justina take <objeto>" antes de saltar al siguiente paso.
+  bool take_retry_pending_{false};
+  std::string take_retry_instruction_;
 
   // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
   // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
