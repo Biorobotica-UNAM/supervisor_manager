@@ -1570,6 +1570,23 @@ private:
            feedback.approved;
   }
 
+  bool isNavigationFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string reason = normalizeText(feedback.failure_reason);
+    return (action == "go_to" || action == "goto") && reason == "navigation_failed";
+  }
+
+  bool isBumperFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string worker = normalizeText(feedback.worker_result);
+    const std::string reason = normalizeText(feedback.failure_reason);
+    return worker.find("bumper") != std::string::npos ||
+           reason.find("bumper") != std::string::npos;
+  }
+
   void updateInstructionPointStateFromGoTo(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
@@ -1948,6 +1965,23 @@ private:
             break;
           }
 
+          // Navigation failures retry indefinitely until goal is reached.
+          // The only accepted stop is a bumper trigger.
+          if (isNavigationFailure(feedback) && !isBumperFailure(feedback))
+          {
+            ++nav_retry_count_;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: navigation failed (retry #%d) for go_to '%s'. reason='%s' worker='%s' — retrying.",
+              nav_retry_count_,
+              feedback.argument.c_str(),
+              feedback.failure_reason.c_str(),
+              feedback.worker_result.c_str());
+            publishRetryCommand();
+            publishAllowNextCycle();
+            break;
+          }
+
           const std::string status_name = executionStatusName(feedback.status);
           std::string reason;
           if (!feedback.failure_reason.empty() &&
@@ -1990,6 +2024,7 @@ private:
 
         if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
+          nav_retry_count_ = 0;
           updateInstructionPointStateFromGoTo(feedback);
 
           if (door_waiting_active_ && isDoorOpenCheckSuccess(feedback)) {
@@ -2139,6 +2174,10 @@ private:
   bool door_retry_pending_{false};
   int door_open_request_count_{0};
   rclcpp::Time door_retry_time_{0, 0, RCL_ROS_TIME};
+
+  // Conteo de reintentos de navegacion (go_to). Se resetea al exito.
+  // Solo un bumper activo acepta detener la navegacion permanentemente.
+  int nav_retry_count_{0};
 
   // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
   // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
