@@ -7,6 +7,7 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
 
+#include <head_interfaces/srv/move_head.hpp>
 #include <known_locations_interfaces/srv/locations_get.hpp>
 #include <listener_interfaces/srv/listen.hpp>
 #include <talker_interfaces/srv/talk.hpp>
@@ -14,11 +15,15 @@
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nlohmann/json.hpp>
+#include <tf2/exceptions.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -36,6 +41,8 @@ class SupervisorManagerNode : public rclcpp::Node
 public:
   explicit SupervisorManagerNode(bool natural_language_planning)
   : Node("supervisor_manager_node"),
+    tf_buffer_(this->get_clock()),
+    tf_listener_(tf_buffer_),
     natural_language_planning_(natural_language_planning)
   {
     RCLCPP_INFO(this->get_logger(), "supervisor_manager_node: started");
@@ -43,6 +50,16 @@ public:
       this->get_logger(),
       "natural_language_planning=%s",
       natural_language_planning_ ? "true" : "false");
+
+    this->declare_parameter<std::string>("map_frame", "map");
+    this->declare_parameter<std::string>("base_frame", "base_link");
+    this->declare_parameter<double>("go_to_success_distance_tolerance_m", 0.75);
+
+    this->get_parameter("map_frame", map_frame_);
+    this->get_parameter("base_frame", base_frame_);
+    this->get_parameter(
+      "go_to_success_distance_tolerance_m",
+      go_to_success_distance_tolerance_m_);
 
     // --- Entradas ROS ---
     // /system/status indica si los modulos minimos estan disponibles.
@@ -116,6 +133,10 @@ public:
       "/nav_controller/go_to_location",
       rmw_qos_profile_services_default,
       hri_client_group_);
+    head_client_ = this->create_client<head_interfaces::srv::MoveHead>(
+      "/hardware/head/move_head",
+      rmw_qos_profile_services_default,
+      hri_client_group_);
 
     // --- Timer principal del FSM (10 Hz) ---
     timer_ = this->create_wall_timer(
@@ -166,6 +187,16 @@ private:
     bool command_aborted{false};
     std::string abort_reason;
     std::vector<std::string> invalid_destinations;
+  };
+
+  struct GoToArrivalVerification
+  {
+    bool applicable{false};
+    bool verified{false};
+    bool within_tolerance{true};
+    double distance_m{0.0};
+    std::string goal_frame;
+    std::string error_message;
   };
 
   // ===== One-shot init =====
@@ -1587,6 +1618,128 @@ private:
            reason.find("bumper") != std::string::npos;
   }
 
+  bool isFindPosePersonNotFound(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string worker = normalizeText(feedback.worker_result);
+    return action == "find_pose" &&
+           worker.size() >= std::strlen("_pose_not_found") &&
+           worker.rfind("_pose_not_found") == worker.size() - std::strlen("_pose_not_found");
+  }
+
+  bool isFindPersonAnybodyNotFound(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string argument = normalizeText(feedback.argument);
+    const std::string worker = normalizeText(feedback.worker_result);
+    return action == "find_person" &&
+           argument.rfind("anybody", 0U) == 0U &&
+           worker.rfind("person_not_found:", 0U) == 0U;
+  }
+
+  void resetFindPersonAnybodyRetryState()
+  {
+    find_person_anybody_retry_count_ = 0;
+    find_person_anybody_retry_argument_.clear();
+  }
+
+  bool moveHeadForFindPersonRetryExhausted()
+  {
+    if (!head_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[FindPersonRetry] Head client not initialized");
+      return false;
+    }
+
+    if (!head_client_->wait_for_service(1s)) {
+      RCLCPP_WARN(this->get_logger(), "[FindPersonRetry] Head service unavailable");
+      return false;
+    }
+
+    auto request = std::make_shared<head_interfaces::srv::MoveHead::Request>();
+    request->positions = {0.0, 0.2};
+
+    auto future = head_client_->async_send_request(request);
+    const auto status = future.wait_for(5s);
+    if (status != std::future_status::ready) {
+      RCLCPP_WARN(this->get_logger(), "[FindPersonRetry] Timeout moving head to [0.0, 0.2]");
+      return false;
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[FindPersonRetry] Head move to [0.0, 0.2] failed: %s",
+        response->message.c_str());
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "[FindPersonRetry] Head moved to [0.0, 0.2]");
+    return true;
+  }
+
+  bool lookupFramePositionInMap(
+    const std::string & source_frame,
+    double & x,
+    double & y,
+    std::string & error_message)
+  {
+    try {
+      const auto tf = tf_buffer_.lookupTransform(
+        map_frame_,
+        source_frame,
+        tf2::TimePointZero,
+        500ms);
+
+      x = tf.transform.translation.x;
+      y = tf.transform.translation.y;
+      error_message.clear();
+      return true;
+    } catch (const tf2::TransformException & ex) {
+      error_message =
+        "cannot lookup TF " + map_frame_ + " -> " + source_frame + ": " + ex.what();
+      return false;
+    }
+  }
+
+  GoToArrivalVerification verifySuccessfulGoToArrival(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    GoToArrivalVerification result;
+    if (!isSuccessfulGoTo(feedback)) {
+      return result;
+    }
+
+    result.applicable = true;
+    result.goal_frame = normalizeKnowledgeToken(feedback.argument);
+    if (result.goal_frame.empty()) {
+      result.error_message = "go_to destination is empty after normalization";
+      return result;
+    }
+
+    double robot_x = 0.0;
+    double robot_y = 0.0;
+    if (!lookupFramePositionInMap(base_frame_, robot_x, robot_y, result.error_message)) {
+      return result;
+    }
+
+    double goal_x = 0.0;
+    double goal_y = 0.0;
+    if (!lookupFramePositionInMap(result.goal_frame, goal_x, goal_y, result.error_message)) {
+      return result;
+    }
+
+    const double dx = goal_x - robot_x;
+    const double dy = goal_y - robot_y;
+
+    result.distance_m = std::sqrt(dx * dx + dy * dy);
+    result.verified = true;
+    result.within_tolerance = result.distance_m <= go_to_success_distance_tolerance_m_;
+    return result;
+  }
+
   void updateInstructionPointStateFromGoTo(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
@@ -2034,6 +2187,49 @@ private:
             break;
           }
 
+          if (isFindPersonAnybodyNotFound(feedback))
+          {
+            const std::string normalized_argument = normalizeText(feedback.argument);
+            if (find_person_anybody_retry_argument_ != normalized_argument) {
+              find_person_anybody_retry_argument_ = normalized_argument;
+              find_person_anybody_retry_count_ = 0;
+            }
+
+            if (find_person_anybody_retry_count_ < MAX_FIND_PERSON_ANYBODY_RETRIES) {
+              ++find_person_anybody_retry_count_;
+              RCLCPP_WARN(
+                this->get_logger(),
+                "SM_WAIT_EXECUTION_RESULT: find_person '%s' did not find anybody (retry #%d/%d).",
+                feedback.argument.c_str(),
+                find_person_anybody_retry_count_,
+                MAX_FIND_PERSON_ANYBODY_RETRIES);
+              publishRetryCommand();
+              publishAllowNextCycle();
+              break;
+            }
+
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: find_person '%s' exhausted %d retries. Moving head to [0.0, 0.2] before continuing.",
+              feedback.argument.c_str(),
+              MAX_FIND_PERSON_ANYBODY_RETRIES);
+            moveHeadForFindPersonRetryExhausted();
+            resetFindPersonAnybodyRetryState();
+          }
+
+          if (isFindPosePersonNotFound(feedback))
+          {
+            ++find_pose_retry_count_;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: find_pose '%s' did not find a person (retry #%d). Retrying until success.",
+              feedback.argument.c_str(),
+              find_pose_retry_count_);
+            publishRetryCommand();
+            publishAllowNextCycle();
+            break;
+          }
+
           // Navigation failures retry indefinitely until goal is reached.
           // The only accepted stop is a bumper trigger.
           if (isNavigationFailure(feedback) && !isBumperFailure(feedback))
@@ -2041,13 +2237,16 @@ private:
             ++nav_retry_count_;
             RCLCPP_WARN(
               this->get_logger(),
-              "SM_WAIT_EXECUTION_RESULT: navigation failed (retry #%d) for go_to '%s'. reason='%s' worker='%s' — retrying.",
+              "SM_WAIT_EXECUTION_RESULT: navigation failed (retry #%d) for go_to '%s'. reason='%s' worker='%s' - retrying.",
               nav_retry_count_,
               feedback.argument.c_str(),
               feedback.failure_reason.c_str(),
               feedback.worker_result.c_str());
             publishRetryCommand();
             publishAllowNextCycle();
+            break;
+          }
+
           if (handleTakeFailureRetry(feedback)) {
             break;
           }
@@ -2094,6 +2293,40 @@ private:
 
         if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
+          if (normalizeText(feedback.action) == "find_person") {
+            resetFindPersonAnybodyRetryState();
+          }
+
+          if (normalizeText(feedback.action) == "find_pose") {
+            find_pose_retry_count_ = 0;
+          }
+
+          const GoToArrivalVerification go_to_arrival = verifySuccessfulGoToArrival(feedback);
+          if (go_to_arrival.applicable && go_to_arrival.verified &&
+              !go_to_arrival.within_tolerance)
+          {
+            ++nav_retry_count_;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: go_to '%s' reported success but robot is still %.2f m away from TF '%s' (tolerance %.2f m). Retrying navigation (#%d).",
+              feedback.argument.c_str(),
+              go_to_arrival.distance_m,
+              go_to_arrival.goal_frame.c_str(),
+              go_to_success_distance_tolerance_m_,
+              nav_retry_count_);
+            publishRetryCommand();
+            publishAllowNextCycle();
+            break;
+          }
+
+          if (go_to_arrival.applicable && !go_to_arrival.verified) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: go_to '%s' succeeded but arrival could not be verified against TF: %s. Accepting success.",
+              feedback.argument.c_str(),
+              go_to_arrival.error_message.c_str());
+          }
+
           nav_retry_count_ = 0;
           if (isTakeAction(feedback)) {
             take_retry_pending_ = false;
@@ -2204,8 +2437,11 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr corrective_instruction_pub_;
   rclcpp::CallbackGroup::SharedPtr hri_client_group_;
   rclcpp::Client<known_locations_interfaces::srv::LocationsGet>::SharedPtr goto_client_;
+  rclcpp::Client<head_interfaces::srv::MoveHead>::SharedPtr head_client_;
   rclcpp::Client<talker_interfaces::srv::Talk>::SharedPtr talker_client_;
   rclcpp::Client<listener_interfaces::srv::Listen>::SharedPtr listener_client_;
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
@@ -2218,6 +2454,9 @@ private:
   // false: usa un plan CLIPS ya definido. true: pide una orden hablada y genera
   // hechos CLIPS antes de planear.
   bool natural_language_planning_{false};
+  std::string map_frame_{"map"};
+  std::string base_frame_{"base_link"};
+  double go_to_success_distance_tolerance_m_{0.75};
   static constexpr int MAX_NATURAL_LANGUAGE_LISTEN_RETRIES = 3;
   bool at_instruction_point_{false};
   bool known_locations_loaded_{false};
@@ -2253,6 +2492,10 @@ private:
   // Conteo de reintentos de navegacion (go_to). Se resetea al exito.
   // Solo un bumper activo acepta detener la navegacion permanentemente.
   int nav_retry_count_{0};
+  int find_pose_retry_count_{0};
+  static constexpr int MAX_FIND_PERSON_ANYBODY_RETRIES = 3;
+  int find_person_anybody_retry_count_{0};
+  std::string find_person_anybody_retry_argument_;
   // Reintento unico para "Justina take <objeto>" antes de saltar al siguiente paso.
   bool take_retry_pending_{false};
   std::string take_retry_instruction_;

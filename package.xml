@@ -20,10 +20,13 @@
   <depend>supervisor_interfaces</depend>
   <depend>clips_interfaces</depend>
   <depend>planning_tools</depend>
+  <depend>head_interfaces</depend>
   <depend>known_locations_interfaces</depend>
   <depend>listener_interfaces</depend>
   <depend>talker_interfaces</depend>
   <depend>nlohmann_json</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
   <depend>yaml-cpp</depend>
 
   <exec_depend>knowledge_bank</exec_depend>

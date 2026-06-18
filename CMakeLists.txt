@@ -18,10 +18,13 @@ find_package(executor_interfaces REQUIRED)
 find_package(supervisor_interfaces REQUIRED)
 find_package(planning_tools REQUIRED)
 find_package(clips_interfaces REQUIRED)
+find_package(head_interfaces REQUIRED)
 find_package(known_locations_interfaces REQUIRED)
 find_package(listener_interfaces REQUIRED)
 find_package(talker_interfaces REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 if(BUILD_TESTING)
@@ -46,10 +49,13 @@ ament_target_dependencies(supervisor_manager_node
   clips_interfaces
   planning_tools
   ament_index_cpp
+  head_interfaces
   known_locations_interfaces
   listener_interfaces
   talker_interfaces
   nlohmann_json
+  tf2
+  tf2_ros
 )
 
 target_link_libraries(supervisor_manager_node
@@ -78,10 +84,13 @@ ament_export_dependencies(
   clips_interfaces
   planning_tools
   ament_index_cpp
+  head_interfaces
   known_locations_interfaces
   listener_interfaces
   talker_interfaces
   nlohmann_json
+  tf2
+  tf2_ros
 )
 
 ament_package()
