@@ -190,6 +190,8 @@ private:
   enum class PersonApproachRecoveryState : uint8_t
   {
     IDLE,
+    WAIT_PARTIAL_APPROACH,
+    WAIT_PREVENTIVE_FIND_POSE,
     WAIT_FIND_POSE,
     WAIT_APPROACH
   };
@@ -1876,6 +1878,12 @@ private:
     return normalizeText(feedback.action) == "approach";
   }
 
+  bool isApproachPartialAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "approach_partial";
+  }
+
   bool isFindPoseAction(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
   {
@@ -1913,6 +1921,31 @@ private:
     const std::string & customer_index) const
   {
     return "waving_" + customer_index;
+  }
+
+  bool customerIndexFromFindPoseArgument(
+    const std::string & argument,
+    std::string & index) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(argument);
+    constexpr const char * prefix = "waving_";
+    if (normalized.rfind(prefix, 0U) != 0U ||
+        normalized.size() <= std::strlen(prefix))
+    {
+      return false;
+    }
+
+    index = normalized.substr(std::strlen(prefix));
+    return std::all_of(
+      index.begin(),
+      index.end(),
+      [](unsigned char c) {return std::isdigit(c) != 0;});
+  }
+
+  std::string customerApproachArgumentForIndex(
+    const std::string & customer_index) const
+  {
+    return "customer_" + customer_index;
   }
 
   std::string findPoseDescription(const std::string & argument) const
@@ -2096,6 +2129,88 @@ private:
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
     if (person_approach_recovery_state_ ==
+        PersonApproachRecoveryState::WAIT_PARTIAL_APPROACH)
+    {
+      if (!isApproachPartialAction(feedback) ||
+          normalizeKnowledgeToken(feedback.argument) !=
+            normalizeKnowledgeToken(person_approach_argument_))
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] preventive partial approach failed for '%s'; continuing with normal failure path",
+          person_approach_argument_.c_str());
+        resetPersonApproachRecovery();
+        return false;
+      }
+
+      person_approach_recovery_state_ =
+        PersonApproachRecoveryState::WAIT_PREVENTIVE_FIND_POSE;
+      person_find_pose_retry_count_ = 0;
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] partial approach completed; refreshing pose with find_pose '%s'",
+        person_find_pose_argument_.c_str());
+
+      if (!promptFindPoseTarget(person_find_pose_argument_)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] could not announce preventive find_pose prompt");
+      }
+
+      const std::string find_pose_instruction =
+        "Justina find_pose " + person_find_pose_argument_;
+      return dispatchOverrideInstruction(find_pose_instruction);
+    }
+
+    if (person_approach_recovery_state_ ==
+        PersonApproachRecoveryState::WAIT_PREVENTIVE_FIND_POSE)
+    {
+      if (!isFindPoseAction(feedback) ||
+          normalizeKnowledgeToken(feedback.argument) !=
+            normalizeKnowledgeToken(person_find_pose_argument_))
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        ++person_find_pose_retry_count_;
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] preventive find_pose '%s' failed (retry #%d).",
+          person_find_pose_argument_.c_str(),
+          person_find_pose_retry_count_);
+
+        if (person_find_pose_retry_count_ == 1 ||
+            person_find_pose_retry_count_ %
+              FIND_POSE_REPROMPT_EVERY_RETRIES == 0)
+        {
+          if (!promptFindPoseTarget(person_find_pose_argument_)) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "[PersonApproachRecovery] could not repeat preventive find_pose prompt");
+          }
+        }
+
+        publishRetryCommand();
+        publishAllowNextCycle();
+        return true;
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] preventive pose refresh completed; continuing normal plan");
+      resetPersonApproachRecovery();
+      find_pose_retry_count_ = 0;
+      publishAllowNextCycle();
+      return true;
+    }
+
+    if (person_approach_recovery_state_ ==
         PersonApproachRecoveryState::WAIT_FIND_POSE)
     {
       if (!isFindPoseAction(feedback) ||
@@ -2176,6 +2291,32 @@ private:
 
     if (!isSuccessfulFeedback(feedback)) {
       return false;
+    }
+
+    if (isFindPoseAction(feedback)) {
+      std::string customer_index;
+      if (!customerIndexFromFindPoseArgument(feedback.argument, customer_index)) {
+        return false;
+      }
+
+      person_approach_argument_ =
+        customerApproachArgumentForIndex(customer_index);
+      person_find_pose_argument_ =
+        findPoseArgumentForCustomerIndex(customer_index);
+      person_find_pose_retry_count_ = 0;
+      person_approach_recovery_state_ =
+        PersonApproachRecoveryState::WAIT_PARTIAL_APPROACH;
+
+      const std::string partial_instruction =
+        "Justina approach_partial " + person_approach_argument_;
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] find_pose '%s' succeeded; inserting preventive partial approach '%s'",
+        feedback.argument.c_str(),
+        partial_instruction.c_str());
+
+      return dispatchOverrideInstruction(partial_instruction);
     }
 
     std::string customer_index;
