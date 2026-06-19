@@ -187,6 +187,13 @@ private:
     WAIT_TAKE_RETRY
   };
 
+  enum class PersonApproachRecoveryState : uint8_t
+  {
+    IDLE,
+    WAIT_FIND_POSE,
+    WAIT_APPROACH
+  };
+
   struct SemanticValidationResult
   {
     bool valid{true};
@@ -1869,6 +1876,72 @@ private:
     return normalizeText(feedback.action) == "approach";
   }
 
+  bool isFindPoseAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "find_pose";
+  }
+
+  bool customerIndexFromApproachArgument(
+    const std::string & argument,
+    std::string & index) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(argument);
+    constexpr const char * prefix = "customer_";
+    if (normalized.rfind(prefix, 0U) != 0U ||
+        normalized.size() <= std::strlen(prefix))
+    {
+      return false;
+    }
+
+    index = normalized.substr(std::strlen(prefix));
+    return std::all_of(
+      index.begin(),
+      index.end(),
+      [](unsigned char c) {return std::isdigit(c) != 0;});
+  }
+
+  bool isCustomerApproachAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback,
+    std::string & customer_index) const
+  {
+    return isApproachAction(feedback) &&
+           customerIndexFromApproachArgument(feedback.argument, customer_index);
+  }
+
+  std::string findPoseArgumentForCustomerIndex(
+    const std::string & customer_index) const
+  {
+    return "waving_" + customer_index;
+  }
+
+  std::string findPoseDescription(const std::string & argument) const
+  {
+    std::string normalized = normalizeKnowledgeToken(argument);
+    const std::size_t sep = normalized.rfind('_');
+    if (sep != std::string::npos && sep + 1 < normalized.size()) {
+      const std::string suffix = normalized.substr(sep + 1);
+      const bool numeric_suffix = std::all_of(
+        suffix.begin(),
+        suffix.end(),
+        [](unsigned char c) {return std::isdigit(c) != 0;});
+      if (numeric_suffix) {
+        normalized = normalized.substr(0, sep);
+      }
+    }
+
+    std::replace(normalized.begin(), normalized.end(), '_', ' ');
+    return normalized.empty() ? "with the requested pose" : normalized;
+  }
+
+  bool promptFindPoseTarget(const std::string & find_pose_argument)
+  {
+    const std::string pose = findPoseDescription(find_pose_argument);
+    return sayText(
+      "I need to confirm your position. I am looking for the person " +
+      pose + ". Please raise your hand and keep it raised.");
+  }
+
   bool isTakePoseOutOfRangeFailure(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
   {
@@ -2009,6 +2082,129 @@ private:
     }
 
     return false;
+  }
+
+  void resetPersonApproachRecovery()
+  {
+    person_approach_recovery_state_ = PersonApproachRecoveryState::IDLE;
+    person_approach_argument_.clear();
+    person_find_pose_argument_.clear();
+    person_find_pose_retry_count_ = 0;
+  }
+
+  bool handlePersonApproachRecovery(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (person_approach_recovery_state_ ==
+        PersonApproachRecoveryState::WAIT_FIND_POSE)
+    {
+      if (!isFindPoseAction(feedback) ||
+          normalizeKnowledgeToken(feedback.argument) !=
+            normalizeKnowledgeToken(person_find_pose_argument_))
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        ++person_find_pose_retry_count_;
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] find_pose '%s' did not confirm the person (retry #%d).",
+          person_find_pose_argument_.c_str(),
+          person_find_pose_retry_count_);
+
+        if (person_find_pose_retry_count_ == 1 ||
+            person_find_pose_retry_count_ %
+              FIND_POSE_REPROMPT_EVERY_RETRIES == 0)
+        {
+          if (!promptFindPoseTarget(person_find_pose_argument_)) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "[PersonApproachRecovery] could not repeat find_pose prompt");
+          }
+        }
+
+        publishRetryCommand();
+        publishAllowNextCycle();
+        return true;
+      }
+
+      person_approach_recovery_state_ =
+        PersonApproachRecoveryState::WAIT_APPROACH;
+      person_find_pose_retry_count_ = 0;
+      find_pose_retry_count_ = 0;
+
+      const std::string approach_instruction =
+        "Justina approach " + person_approach_argument_;
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] find_pose confirmed target; refining approach with '%s'",
+        approach_instruction.c_str());
+
+      return dispatchOverrideInstruction(approach_instruction);
+    }
+
+    if (person_approach_recovery_state_ ==
+        PersonApproachRecoveryState::WAIT_APPROACH)
+    {
+      if (!isApproachAction(feedback) ||
+          normalizeKnowledgeToken(feedback.argument) !=
+            normalizeKnowledgeToken(person_approach_argument_))
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] refined approach failed for '%s'; continuing with normal failure path",
+          person_approach_argument_.c_str());
+        resetPersonApproachRecovery();
+        return false;
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] refined approach completed for '%s'",
+        person_approach_argument_.c_str());
+      resetPersonApproachRecovery();
+      nav_retry_count_ = 0;
+      publishAllowNextCycle();
+      return true;
+    }
+
+    if (!isSuccessfulFeedback(feedback)) {
+      return false;
+    }
+
+    std::string customer_index;
+    if (!isCustomerApproachAction(feedback, customer_index)) {
+      return false;
+    }
+
+    person_approach_argument_ = normalizeKnowledgeToken(feedback.argument);
+    person_find_pose_argument_ =
+      findPoseArgumentForCustomerIndex(customer_index);
+    person_find_pose_retry_count_ = 0;
+    nav_retry_count_ = 0;
+    person_approach_recovery_state_ =
+      PersonApproachRecoveryState::WAIT_FIND_POSE;
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[PersonApproachRecovery] customer approach reached; requesting pose confirmation with find_pose '%s'",
+      person_find_pose_argument_.c_str());
+
+    if (!promptFindPoseTarget(person_find_pose_argument_)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[PersonApproachRecovery] could not announce pose confirmation prompt");
+    }
+
+    const std::string find_pose_instruction =
+      "Justina find_pose " + person_find_pose_argument_;
+    return dispatchOverrideInstruction(find_pose_instruction);
   }
 
   void announceFailureAndContinue(
@@ -2278,6 +2474,11 @@ private:
           break;
         }
 
+        if (handlePersonApproachRecovery(feedback))
+        {
+          break;
+        }
+
         if (!feedback.approved || isExecutionFailureStatus(feedback.status))
         {
           if (handleDataCaptureFailure(feedback)) {
@@ -2322,6 +2523,17 @@ private:
               "SM_WAIT_EXECUTION_RESULT: find_pose '%s' did not find a person (retry #%d). Retrying until success.",
               feedback.argument.c_str(),
               find_pose_retry_count_);
+
+            if (find_pose_retry_count_ == 1 ||
+                find_pose_retry_count_ % FIND_POSE_REPROMPT_EVERY_RETRIES == 0)
+            {
+              if (!promptFindPoseTarget(feedback.argument)) {
+                RCLCPP_WARN(
+                  this->get_logger(),
+                  "SM_WAIT_EXECUTION_RESULT: could not repeat find_pose prompt");
+              }
+            }
+
             publishRetryCommand();
             publishAllowNextCycle();
             break;
@@ -2602,6 +2814,14 @@ private:
   // la base con approach y luego reintenta el mismo take una sola vez.
   TakeApproachRetryState take_approach_retry_state_{TakeApproachRetryState::IDLE};
   std::string take_approach_retry_argument_;
+  // Recuperacion para clientes/personas: despues de approach customer_N,
+  // pide confirmar waving_N, actualiza la pose con find_pose y acerca otra vez.
+  static constexpr int FIND_POSE_REPROMPT_EVERY_RETRIES = 3;
+  PersonApproachRecoveryState person_approach_recovery_state_{
+    PersonApproachRecoveryState::IDLE};
+  std::string person_approach_argument_;
+  std::string person_find_pose_argument_;
+  int person_find_pose_retry_count_{0};
 
   // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
   // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
