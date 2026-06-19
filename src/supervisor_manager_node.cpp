@@ -180,6 +180,13 @@ private:
     WAIT_DROP_GIFT
   };
 
+  enum class TakeApproachRetryState : uint8_t
+  {
+    IDLE,
+    WAIT_APPROACH,
+    WAIT_TAKE_RETRY
+  };
+
   struct SemanticValidationResult
   {
     bool valid{true};
@@ -1856,6 +1863,19 @@ private:
     return normalizeText(feedback.action) == "take";
   }
 
+  bool isApproachAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "approach";
+  }
+
+  bool isTakePoseOutOfRangeFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return isTakeAction(feedback) &&
+           normalizeText(feedback.worker_result) == "pose_out_of_range";
+  }
+
   bool isJustinaTakeInstruction(const std::string & instruction) const
   {
     const std::string normalized = normalizeText(instruction);
@@ -1903,6 +1923,27 @@ private:
     take_retry_pending_ = true;
     take_retry_instruction_ = instruction_key;
 
+    if (isTakePoseOutOfRangeFailure(feedback)) {
+      take_approach_retry_state_ = TakeApproachRetryState::WAIT_APPROACH;
+      take_approach_retry_argument_ = feedback.argument;
+
+      const std::string approach_instruction =
+        "Justina approach " + feedback.argument;
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakeRetry] Take target is out of range; injecting approach before retry: '%s'",
+        approach_instruction.c_str());
+
+      if (!sayText("I need to get closer first.")) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[TakeRetry] could not announce approach recovery through TTS");
+      }
+
+      return dispatchOverrideInstruction(approach_instruction);
+    }
+
     RCLCPP_WARN(
       this->get_logger(),
       "[TakeRetry] Retrying failed take instruction once: '%s'",
@@ -1917,6 +1958,57 @@ private:
     publishRetryCommand();
     publishAllowNextCycle();
     return true;
+  }
+
+  bool handleTakeApproachRecovery(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (take_approach_retry_state_ == TakeApproachRetryState::IDLE) {
+      return false;
+    }
+
+    const std::string retry_argument = normalizeText(take_approach_retry_argument_);
+
+    if (take_approach_retry_state_ == TakeApproachRetryState::WAIT_APPROACH) {
+      if (!isApproachAction(feedback) ||
+          normalizeText(feedback.argument) != retry_argument)
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[TakeRetry] Approach recovery failed for '%s'; continuing with normal failure path",
+          take_approach_retry_argument_.c_str());
+        take_approach_retry_state_ = TakeApproachRetryState::IDLE;
+        take_approach_retry_argument_.clear();
+        take_retry_pending_ = false;
+        take_retry_instruction_.clear();
+        return false;
+      }
+
+      take_approach_retry_state_ = TakeApproachRetryState::WAIT_TAKE_RETRY;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[TakeRetry] Approach completed; retrying original take: '%s'",
+        take_retry_instruction_.c_str());
+      return dispatchOverrideInstruction(take_retry_instruction_);
+    }
+
+    if (take_approach_retry_state_ == TakeApproachRetryState::WAIT_TAKE_RETRY) {
+      if (!isTakeAction(feedback) ||
+          normalizeText(feedback.argument) != retry_argument)
+      {
+        return false;
+      }
+
+      take_approach_retry_state_ = TakeApproachRetryState::IDLE;
+      take_approach_retry_argument_.clear();
+      return false;
+    }
+
+    return false;
   }
 
   void announceFailureAndContinue(
@@ -2181,6 +2273,11 @@ private:
           break;
         }
 
+        if (handleTakeApproachRecovery(feedback))
+        {
+          break;
+        }
+
         if (!feedback.approved || isExecutionFailureStatus(feedback.status))
         {
           if (handleDataCaptureFailure(feedback)) {
@@ -2331,6 +2428,8 @@ private:
           if (isTakeAction(feedback)) {
             take_retry_pending_ = false;
             take_retry_instruction_.clear();
+            take_approach_retry_state_ = TakeApproachRetryState::IDLE;
+            take_approach_retry_argument_.clear();
           }
 
           updateInstructionPointStateFromGoTo(feedback);
@@ -2499,6 +2598,10 @@ private:
   // Reintento unico para "Justina take <objeto>" antes de saltar al siguiente paso.
   bool take_retry_pending_{false};
   std::string take_retry_instruction_;
+  // Recuperacion especifica: si take reporta pose_out_of_range, primero acerca
+  // la base con approach y luego reintenta el mismo take una sola vez.
+  TakeApproachRetryState take_approach_retry_state_{TakeApproachRetryState::IDLE};
+  std::string take_approach_retry_argument_;
 
   // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
   // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
