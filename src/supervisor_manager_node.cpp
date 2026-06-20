@@ -2204,6 +2204,7 @@ private:
       RCLCPP_INFO(
         this->get_logger(),
         "[PersonApproachRecovery] preventive pose refresh completed; continuing normal plan");
+      person_preventive_refined_approach_argument_ = person_approach_argument_;
       resetPersonApproachRecovery();
       find_pose_retry_count_ = 0;
       publishAllowNextCycle();
@@ -2325,6 +2326,18 @@ private:
     }
 
     person_approach_argument_ = normalizeKnowledgeToken(feedback.argument);
+    if (!person_preventive_refined_approach_argument_.empty() &&
+        person_approach_argument_ ==
+          normalizeKnowledgeToken(person_preventive_refined_approach_argument_))
+    {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] skipping post-arrival confirmation for '%s' because preventive refinement already succeeded",
+        person_approach_argument_.c_str());
+      person_preventive_refined_approach_argument_.clear();
+      return false;
+    }
+
     person_find_pose_argument_ =
       findPoseArgumentForCustomerIndex(customer_index);
     person_find_pose_retry_count_ = 0;
@@ -2962,6 +2975,7 @@ private:
     PersonApproachRecoveryState::IDLE};
   std::string person_approach_argument_;
   std::string person_find_pose_argument_;
+  std::string person_preventive_refined_approach_argument_;
   int person_find_pose_retry_count_{0};
 
   // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
