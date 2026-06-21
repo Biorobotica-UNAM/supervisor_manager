@@ -1022,7 +1022,8 @@ private:
 
   bool answerHasStop(const std::string & text) const
   {
-    return normalizeText(text).find("stop") != std::string::npos;
+    const std::string answer = normalizeConfirmationCommand(text);
+    return answer == "stop" || answer.rfind("stop ", 0U) == 0U;
   }
 
   bool answerHasFollowOrContinue(const std::string & text) const
@@ -1103,6 +1104,28 @@ private:
     return "";
   }
 
+  void waitForFollowGiftStop()
+  {
+    int attempt = 1;
+    while (rclcpp::ok()) {
+      if (attempt > 1 && attempt % FOLLOW_GIFT_STOP_REPROMPT_EVERY_ATTEMPTS == 0) {
+        sayText("Say stop when you want me to stop.");
+      }
+
+      const std::string answer = listenFollowGiftAnswer();
+      if (answerHasStop(answer)) {
+        return;
+      }
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[FollowGift] still waiting for stop; ignoring answer '%s' (attempt %d)",
+        answer.c_str(),
+        attempt);
+      ++attempt;
+    }
+  }
+
   bool dispatchFollowGiftInstruction(
     const std::string & instruction,
     FollowGiftState next_state)
@@ -1165,12 +1188,8 @@ private:
           return false;
         }
 
-        const std::string answer = waitForFollowGiftAnswer(false);
-        if (answer.empty()) {
-          sayText("I could not hear stop clearly. I will stop following now.");
-        } else if (answer == "stop") {
-          sayText("Understood. I am ready to leave the gift.");
-        }
+        waitForFollowGiftStop();
+        sayText("Understood. I am ready to leave the gift.");
 
         return dispatchFollowGiftInstruction(
           "Justina follow disable",
@@ -1303,18 +1322,18 @@ private:
       makeSpeechFriendly(listenAttributeFromArgument(listen_argument));
 
     if (attribute == "name") {
-      return "I understood your name is " + value + ". Is that correct?";
+      return "Your name is " + value + ". Is that correct?";
     }
 
     if (attribute == "drink") {
-      return "I understood your drink is " + value + ". Is that correct?";
+      return "Your drink is " + value + ". Is that correct?";
     }
 
     if (attribute == "order") {
-      return "I understood your order is " + value + ". Is that correct?";
+      return "Your order is " + value + ". Is that correct?";
     }
 
-    return "I understood " + attribute + " as " + value + ". Is that correct?";
+    return "Your " + makeSpeechFriendly(attribute) + " is " + value + ". Is that correct?";
   }
 
   std::string listenYesNo()
@@ -1356,23 +1375,39 @@ private:
     return response->recognized_speech;
   }
 
-  bool isYesAnswer(const std::string & text) const
+  std::string normalizeConfirmationCommand(const std::string & text) const
   {
+    // Para la confirmacion solo un "no" directo corrige el dato; lo demas avanza.
     const std::string normalized = normalizeText(text);
-    return normalized.find("yes") != std::string::npos ||
-           normalized.find("yeah") != std::string::npos ||
-           normalized.find("correct") != std::string::npos ||
-           normalized.find("right") != std::string::npos ||
-           normalized.find("continue") != std::string::npos;
+    std::string command;
+    bool last_was_space = true;
+
+    for (unsigned char c : normalized) {
+      if (std::isalnum(c)) {
+        command.push_back(static_cast<char>(c));
+        last_was_space = false;
+      } else if (!last_was_space) {
+        command.push_back(' ');
+        last_was_space = true;
+      }
+    }
+
+    if (!command.empty() && command.back() == ' ') {
+      command.pop_back();
+    }
+
+    return command;
   }
 
   bool isNoAnswer(const std::string & text) const
   {
-    const std::string normalized = normalizeText(text);
-    return normalized.find("no") != std::string::npos ||
-           normalized.find("nope") != std::string::npos ||
-           normalized.find("wrong") != std::string::npos ||
-           normalized.find("incorrect") != std::string::npos;
+    const std::string command = normalizeConfirmationCommand(text);
+    return command == "no" ||
+           command == "nope" ||
+           command == "wrong" ||
+           command == "incorrect" ||
+           command.rfind("no ", 0U) == 0U ||
+           command.rfind("nope ", 0U) == 0U;
   }
 
   void clearDataConfirmation()
@@ -1480,36 +1515,23 @@ private:
       pending_confirmation_listen_argument_,
       pending_confirmation_value_);
 
-    // Si el yes/no no se entiende, se repite solo la confirmacion. No volvemos
-    // a pedir el dato completo a menos que el usuario responda explicitamente no.
-    for (int yes_no_attempt = 1;
-         yes_no_attempt <= MAX_CONFIRMATION_ATTEMPTS;
-         ++yes_no_attempt)
-    {
-      if (yes_no_attempt > 1) {
-        sayText("I could not understand if that was correct. " + phrase);
-      } else {
-        sayText(phrase);
-      }
+    // Una sola confirmacion: solo un "no" directo repite la captura. Silencio,
+    // ruido o cualquier otra respuesta se acepta para no bloquear el plan.
+    sayText(phrase);
+    const std::string answer = listenYesNo();
+    if (!isNoAnswer(answer)) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Confirmation] Treating answer '%s' as confirmation for '%s'='%s'",
+        answer.c_str(),
+        pending_confirmation_listen_argument_.c_str(),
+        pending_confirmation_value_.c_str());
+      clearDataConfirmation();
+      return false;
+    }
 
-      const std::string answer = listenYesNo();
-      if (isYesAnswer(answer)) {
-        RCLCPP_INFO(
-          this->get_logger(),
-          "[Confirmation] User confirmed '%s'='%s'",
-          pending_confirmation_listen_argument_.c_str(),
-          pending_confirmation_value_.c_str());
-        clearDataConfirmation();
-        return false;
-      }
-
-      if (isNoAnswer(answer)) {
-        if (confirmation_attempts_ < MAX_CONFIRMATION_ATTEMPTS) {
-          return retryDataCapture();
-        }
-
-        break;
-      }
+    if (confirmation_attempts_ < MAX_CONFIRMATION_ATTEMPTS) {
+      return retryDataCapture();
     }
 
     bool active_plan = true;
@@ -2940,8 +2962,8 @@ private:
   bool corrective_pending_ = false;
 
   // Estado para confirmar datos guardados por patrones say ask_* + listen X.
-  // La cantidad maxima de intentos se define aqui.
-  static constexpr int MAX_CONFIRMATION_ATTEMPTS = 3;
+  // Permite la captura inicial y un solo reintento si el usuario dice "no".
+  static constexpr int MAX_CONFIRMATION_ATTEMPTS = 2;
   std::string pending_confirmation_ask_key_;
   std::string pending_confirmation_listen_argument_;
   std::string pending_confirmation_value_;
@@ -2981,6 +3003,7 @@ private:
   // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
   // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
   static constexpr int MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS = 3;
+  static constexpr int FOLLOW_GIFT_STOP_REPROMPT_EVERY_ATTEMPTS = 3;
   FollowGiftState follow_gift_state_{FollowGiftState::IDLE};
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
