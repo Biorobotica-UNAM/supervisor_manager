@@ -200,6 +200,7 @@ private:
   {
     IDLE,
     WAIT_APPROACH,
+    WAIT_ALIGN,
     WAIT_FIND_OBJECT,
     WAIT_TAKE_RETRY
   };
@@ -2261,7 +2262,7 @@ private:
       }
 
       take_pnp_recovery_argument_ = feedback.argument;
-      take_pnp_recovery_count_ = 1;
+      take_pnp_recovery_count_ = 2;
       take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_APPROACH;
 
       RCLCPP_WARN(
@@ -2293,6 +2294,27 @@ private:
       RCLCPP_INFO(
         this->get_logger(),
         "[TakePnpRecovery] Approach completed; finding object '%s'",
+        take_pnp_recovery_argument_.c_str());
+
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_ALIGN;
+      return dispatchOverrideInstruction(
+        "Justina align table");
+    }
+
+    // WAIT_ALING: wait for align result, then dispatch take.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_ALIGN) {
+      if (normalizeText(feedback.action) != "align" ||
+          normalizeText(feedback.argument) != "table") {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        return handleTakePnpRecoveryStepFailure("align");
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[TakePnpRecovery] Align completed; finding object '%s'",
         take_pnp_recovery_argument_.c_str());
 
       take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_FIND_OBJECT;
