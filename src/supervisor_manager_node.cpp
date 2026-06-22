@@ -1217,7 +1217,7 @@ private:
         }
 
         return dispatchFollowGiftInstruction(
-          "Justina drop gift",
+          "Justina drop floor",
           FollowGiftState::WAIT_DROP_GIFT);
       }
 
@@ -1225,7 +1225,7 @@ private:
       {
         // La secuencia dinamica termina despues de ejecutar drop gift; desde aqui
         // el manager vuelve al flujo normal del plan.
-        if (!feedbackMatches(feedback, "drop", "gift")) {
+        if (!feedbackMatches(feedback, "drop", "floor")) {
           return false;
         }
 
