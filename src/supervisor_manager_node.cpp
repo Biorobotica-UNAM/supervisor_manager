@@ -196,6 +196,14 @@ private:
     WAIT_APPROACH
   };
 
+  enum class TakePnpRecoveryState : uint8_t
+  {
+    IDLE,
+    WAIT_APPROACH,
+    WAIT_FIND_OBJECT,
+    WAIT_TAKE_RETRY
+  };
+
   struct SemanticValidationResult
   {
     bool valid{true};
@@ -1402,12 +1410,24 @@ private:
   bool isNoAnswer(const std::string & text) const
   {
     const std::string command = normalizeConfirmationCommand(text);
-    return command == "no" ||
-           command == "nope" ||
-           command == "wrong" ||
-           command == "incorrect" ||
-           command.rfind("no ", 0U) == 0U ||
-           command.rfind("nope ", 0U) == 0U;
+    // Exact matches for common single-word rejections.
+    if (command == "no" || command == "nope" || command == "wrong" ||
+        command == "incorrect" || command == "false" || command == "robot no")
+    {
+      return true;
+    }
+    // Prefix matches ("no, that's fine", "nope", etc.).
+    if (command.rfind("no ", 0U) == 0U || command.rfind("nope ", 0U) == 0U) {
+      return true;
+    }
+    // Substring matches for multi-word rejections.
+    // "that's wrong" → "that s wrong", "that's incorrect" → "that s incorrect".
+    if (command.find("wrong") != std::string::npos ||
+        command.find("incorrect") != std::string::npos)
+    {
+      return true;
+    }
+    return false;
   }
 
   void clearDataConfirmation()
@@ -1677,10 +1697,25 @@ private:
            worker.rfind("person_not_found:", 0U) == 0U;
   }
 
+  bool isFindObjectNotFound(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string worker = normalizeText(feedback.worker_result);
+    return action == "find_object" &&
+           worker.rfind("object_not_found:", 0U) == 0U;
+  }
+
   void resetFindPersonAnybodyRetryState()
   {
     find_person_anybody_retry_count_ = 0;
     find_person_anybody_retry_argument_.clear();
+  }
+
+  void resetFindObjectRetryState()
+  {
+    find_object_retry_count_ = 0;
+    find_object_retry_argument_.clear();
   }
 
   bool moveHeadForFindPersonRetryExhausted()
@@ -2032,6 +2067,11 @@ private:
       return false;
     }
 
+    // PNP recovery is already managing this take failure; don't interfere.
+    if (take_pnp_recovery_state_ != TakePnpRecoveryState::IDLE) {
+      return false;
+    }
+
     const std::string instruction_key = takeRetryInstructionKey(feedback);
     if (instruction_key.empty()) {
       return false;
@@ -2134,6 +2174,167 @@ private:
       take_approach_retry_state_ = TakeApproachRetryState::IDLE;
       take_approach_retry_argument_.clear();
       return false;
+    }
+
+    return false;
+  }
+
+  // ===== Take PNP Recovery =====
+  // When take fails, injects approach + find_object + take as override
+  // instructions, up to MAX_TAKE_PNP_RECOVERY_ATTEMPTS times.
+  // On exhaustion the object is added to take_ignored_objects_ and the
+  // global plan resumes normally.
+
+  bool isTakeIgnored(const std::string & argument) const
+  {
+    return take_ignored_objects_.count(normalizeText(argument)) > 0;
+  }
+
+  void resetTakePnpRecovery()
+  {
+    take_pnp_recovery_state_ = TakePnpRecoveryState::IDLE;
+    take_pnp_recovery_argument_.clear();
+    take_pnp_recovery_count_ = 0;
+  }
+
+  bool handleTakePnpRecoveryStepFailure(const std::string & step)
+  {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[TakePnpRecovery] Recovery step '%s' failed for '%s' (attempt %d/%d)",
+      step.c_str(),
+      take_pnp_recovery_argument_.c_str(),
+      take_pnp_recovery_count_,
+      MAX_TAKE_PNP_RECOVERY_ATTEMPTS);
+
+    if (take_pnp_recovery_count_ < MAX_TAKE_PNP_RECOVERY_ATTEMPTS) {
+      ++take_pnp_recovery_count_;
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_APPROACH;
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakePnpRecovery] Retrying full recovery for '%s' (attempt %d/%d)",
+        take_pnp_recovery_argument_.c_str(),
+        take_pnp_recovery_count_,
+        MAX_TAKE_PNP_RECOVERY_ATTEMPTS);
+
+      if (!sayText("I will try once more.")) {
+        RCLCPP_WARN(this->get_logger(), "[TakePnpRecovery] TTS failed");
+      }
+
+      return dispatchOverrideInstruction("Justina approach " + take_pnp_recovery_argument_);
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[TakePnpRecovery] Recovery exhausted for '%s'; ignoring object and continuing",
+      take_pnp_recovery_argument_.c_str());
+
+    take_ignored_objects_.insert(normalizeText(take_pnp_recovery_argument_));
+
+    if (!sayText(
+        "I could not pick up " + makeSpeechFriendly(take_pnp_recovery_argument_) +
+        " after several attempts. I will skip it."))
+    {
+      RCLCPP_WARN(this->get_logger(), "[TakePnpRecovery] TTS failed");
+    }
+
+    resetTakePnpRecovery();
+    publishAllowNextCycle();
+    return true;
+  }
+
+  bool handleTakePnpRecovery(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    const std::string argument = normalizeText(feedback.argument);
+    const std::string recovery_arg = normalizeText(take_pnp_recovery_argument_);
+
+    // IDLE: detect a new take failure and start the recovery sequence.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::IDLE) {
+      if (!isTakeAction(feedback) ||
+          feedback.approved ||
+          !isExecutionFailureStatus(feedback.status) ||
+          isTakeIgnored(feedback.argument))
+      {
+        return false;
+      }
+
+      take_pnp_recovery_argument_ = feedback.argument;
+      take_pnp_recovery_count_ = 1;
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_APPROACH;
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakePnpRecovery] Take '%s' failed; starting recovery attempt 1/%d",
+        feedback.argument.c_str(),
+        MAX_TAKE_PNP_RECOVERY_ATTEMPTS);
+
+      if (!sayText(
+          "I could not pick up " + makeSpeechFriendly(feedback.argument) +
+          ". I will approach and try again."))
+      {
+        RCLCPP_WARN(this->get_logger(), "[TakePnpRecovery] TTS failed");
+      }
+
+      return dispatchOverrideInstruction("Justina approach " + feedback.argument);
+    }
+
+    // WAIT_APPROACH: wait for approach result, then dispatch find_object.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_APPROACH) {
+      if (!isApproachAction(feedback) || argument != recovery_arg) {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        return handleTakePnpRecoveryStepFailure("approach");
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[TakePnpRecovery] Approach completed; finding object '%s'",
+        take_pnp_recovery_argument_.c_str());
+
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_FIND_OBJECT;
+      return dispatchOverrideInstruction(
+        "Justina find_object " + take_pnp_recovery_argument_);
+    }
+
+    // WAIT_FIND_OBJECT: wait for find_object result, then dispatch take.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_FIND_OBJECT) {
+      if (normalizeText(feedback.action) != "find_object" || argument != recovery_arg) {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        return handleTakePnpRecoveryStepFailure("find_object");
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[TakePnpRecovery] Find object succeeded; retrying take '%s'",
+        take_pnp_recovery_argument_.c_str());
+
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_TAKE_RETRY;
+      return dispatchOverrideInstruction("Justina take " + take_pnp_recovery_argument_);
+    }
+
+    // WAIT_TAKE_RETRY: wait for the retried take result.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_TAKE_RETRY) {
+      if (!isTakeAction(feedback) || argument != recovery_arg) {
+        return false;
+      }
+
+      if (isSuccessfulFeedback(feedback)) {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[TakePnpRecovery] Take '%s' succeeded during recovery; resuming plan",
+          take_pnp_recovery_argument_.c_str());
+        resetTakePnpRecovery();
+        return false;  // Let the normal success path advance the plan.
+      }
+
+      return handleTakePnpRecoveryStepFailure("take");
     }
 
     return false;
@@ -2296,10 +2497,22 @@ private:
       if (!isSuccessfulFeedback(feedback)) {
         RCLCPP_WARN(
           this->get_logger(),
-          "[PersonApproachRecovery] refined approach failed for '%s'; continuing with normal failure path",
-          person_approach_argument_.c_str());
-        resetPersonApproachRecovery();
-        return false;
+          "[PersonApproachRecovery] approach failed for '%s'; re-finding pose '%s' to retry",
+          person_approach_argument_.c_str(),
+          person_find_pose_argument_.c_str());
+
+        person_approach_recovery_state_ = PersonApproachRecoveryState::WAIT_FIND_POSE;
+        person_find_pose_retry_count_ = 0;
+
+        if (!promptFindPoseTarget(person_find_pose_argument_)) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[PersonApproachRecovery] could not announce find_pose prompt after approach failure");
+        }
+
+        const std::string find_pose_instruction =
+          "Justina find_pose " + person_find_pose_argument_;
+        return dispatchOverrideInstruction(find_pose_instruction);
       }
 
       RCLCPP_INFO(
@@ -2313,6 +2526,30 @@ private:
     }
 
     if (!isSuccessfulFeedback(feedback)) {
+      std::string customer_index;
+      if (isCustomerApproachAction(feedback, customer_index)) {
+        person_preventive_refined_approach_argument_.clear();
+        person_approach_argument_ = normalizeKnowledgeToken(feedback.argument);
+        person_find_pose_argument_ = findPoseArgumentForCustomerIndex(customer_index);
+        person_find_pose_retry_count_ = 0;
+        person_approach_recovery_state_ = PersonApproachRecoveryState::WAIT_FIND_POSE;
+
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] approach '%s' failed from plan; re-finding pose '%s'",
+          feedback.argument.c_str(),
+          person_find_pose_argument_.c_str());
+
+        if (!promptFindPoseTarget(person_find_pose_argument_)) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[PersonApproachRecovery] could not announce find_pose prompt after approach failure");
+        }
+
+        const std::string find_pose_instruction =
+          "Justina find_pose " + person_find_pose_argument_;
+        return dispatchOverrideInstruction(find_pose_instruction);
+      }
       return false;
     }
 
@@ -2645,6 +2882,11 @@ private:
           break;
         }
 
+        if (handleTakePnpRecovery(feedback))
+        {
+          break;
+        }
+
         if (handleTakeApproachRecovery(feedback))
         {
           break;
@@ -2689,6 +2931,35 @@ private:
               MAX_FIND_PERSON_ANYBODY_RETRIES);
             moveHeadForFindPersonRetryExhausted();
             resetFindPersonAnybodyRetryState();
+          }
+
+          if (isFindObjectNotFound(feedback))
+          {
+            const std::string normalized_argument = normalizeText(feedback.argument);
+            if (find_object_retry_argument_ != normalized_argument) {
+              find_object_retry_argument_ = normalized_argument;
+              find_object_retry_count_ = 0;
+            }
+
+            if (find_object_retry_count_ < MAX_FIND_OBJECT_RETRIES) {
+              ++find_object_retry_count_;
+              RCLCPP_WARN(
+                this->get_logger(),
+                "SM_WAIT_EXECUTION_RESULT: find_object '%s' did not find the object (retry #%d/%d).",
+                feedback.argument.c_str(),
+                find_object_retry_count_,
+                MAX_FIND_OBJECT_RETRIES);
+              publishRetryCommand();
+              publishAllowNextCycle();
+              break;
+            }
+
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: find_object '%s' exhausted %d retries. Continuing.",
+              feedback.argument.c_str(),
+              MAX_FIND_OBJECT_RETRIES);
+            resetFindObjectRetryState();
           }
 
           if (isFindPosePersonNotFound(feedback))
@@ -2759,13 +3030,28 @@ private:
         // En el bloque de retry:
 		if (needsApprovalRetry(feedback.action) && !feedback.approved)
 		{
+		  // For confirmation listens, only an explicit "no" phrase should trigger
+		  // a retry. Silence, unclear speech, or any non-negative response means
+		  // the user accepted, so proceed to the next instruction.
+		  if (normalizeText(feedback.action) == "listen" &&
+              normalizeText(feedback.argument) == "confirm" &&
+              !isNoAnswer(feedback.worker_result))
+          {
+            RCLCPP_INFO(
+              this->get_logger(),
+              "[Confirmation] listen confirm: non-negative response '%s'; treating as acceptance",
+              feedback.worker_result.c_str());
+            publishAllowNextCycle();
+            break;
+          }
+
 		  if (!corrective_pending_) {
 			  const std::string corrective =
 				getCorrectiveInstruction(feedback.action, feedback.argument);
 			  if (!corrective.empty()) {
 				// Rewind para que el listen se reintente después del say
 				rewind_pub_->publish(std_msgs::msg::Empty{});
-				
+
 				std_msgs::msg::String inj;
 				inj.data = corrective;
 				corrective_instruction_pub_->publish(inj);
@@ -2780,6 +3066,10 @@ private:
         {
           if (normalizeText(feedback.action) == "find_person") {
             resetFindPersonAnybodyRetryState();
+          }
+
+          if (normalizeText(feedback.action) == "find_object") {
+            resetFindObjectRetryState();
           }
 
           if (normalizeText(feedback.action) == "find_pose") {
@@ -2818,6 +3108,7 @@ private:
             take_retry_instruction_.clear();
             take_approach_retry_state_ = TakeApproachRetryState::IDLE;
             take_approach_retry_argument_.clear();
+            resetTakePnpRecovery();
           }
 
           updateInstructionPointStateFromGoTo(feedback);
@@ -2980,9 +3271,12 @@ private:
   // Solo un bumper activo acepta detener la navegacion permanentemente.
   int nav_retry_count_{0};
   int find_pose_retry_count_{0};
-  static constexpr int MAX_FIND_PERSON_ANYBODY_RETRIES = 3;
+  static constexpr int MAX_FIND_PERSON_ANYBODY_RETRIES = 2;
   int find_person_anybody_retry_count_{0};
   std::string find_person_anybody_retry_argument_;
+  static constexpr int MAX_FIND_OBJECT_RETRIES = 2;
+  int find_object_retry_count_{0};
+  std::string find_object_retry_argument_;
   // Reintento unico para "Justina take <objeto>" antes de saltar al siguiente paso.
   bool take_retry_pending_{false};
   std::string take_retry_instruction_;
@@ -2990,6 +3284,14 @@ private:
   // la base con approach y luego reintenta el mismo take una sola vez.
   TakeApproachRetryState take_approach_retry_state_{TakeApproachRetryState::IDLE};
   std::string take_approach_retry_argument_;
+  // Recuperacion PNP: ante cualquier fallo de take, ejecuta approach +
+  // find_object + take hasta MAX_TAKE_PNP_RECOVERY_ATTEMPTS veces; si se
+  // agota, el objeto se ignora y el plan continua.
+  static constexpr int MAX_TAKE_PNP_RECOVERY_ATTEMPTS = 2;
+  TakePnpRecoveryState take_pnp_recovery_state_{TakePnpRecoveryState::IDLE};
+  std::string take_pnp_recovery_argument_;
+  int take_pnp_recovery_count_{0};
+  std::unordered_set<std::string> take_ignored_objects_;
   // Recuperacion para clientes/personas: despues de approach customer_N,
   // pide confirmar waving_N, actualiza la pose con find_pose y acerca otra vez.
   static constexpr int FIND_POSE_REPROMPT_EVERY_RETRIES = 3;
