@@ -2262,7 +2262,7 @@ private:
       }
 
       take_pnp_recovery_argument_ = feedback.argument;
-      take_pnp_recovery_count_ = 2;
+      take_pnp_recovery_count_ = 1;
       take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_APPROACH;
 
       RCLCPP_WARN(
