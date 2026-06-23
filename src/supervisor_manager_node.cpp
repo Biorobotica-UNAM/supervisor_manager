@@ -1756,6 +1756,19 @@ private:
     find_object_retry_argument_.clear();
   }
 
+  bool isAnalyzeFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    return action == "analyze" || action == "analyze_objects" || action == "analyze_object";
+  }
+
+  void resetAnalyzeRetryState()
+  {
+    analyze_retry_count_ = 0;
+    analyze_retry_argument_.clear();
+  }
+
   bool moveHeadForFindPersonRetryExhausted()
   {
     if (!head_client_) {
@@ -3021,6 +3034,35 @@ private:
             resetFindObjectRetryState();
           }
 
+          if (isAnalyzeFailure(feedback))
+          {
+            const std::string normalized_argument = normalizeText(feedback.argument);
+            if (analyze_retry_argument_ != normalized_argument) {
+              analyze_retry_argument_ = normalized_argument;
+              analyze_retry_count_ = 0;
+            }
+
+            if (analyze_retry_count_ < MAX_ANALYZE_RETRIES) {
+              ++analyze_retry_count_;
+              RCLCPP_WARN(
+                this->get_logger(),
+                "SM_WAIT_EXECUTION_RESULT: analyze '%s' failed (retry #%d/%d).",
+                feedback.argument.c_str(),
+                analyze_retry_count_,
+                MAX_ANALYZE_RETRIES);
+              publishRetryCommand();
+              publishAllowNextCycle();
+              break;
+            }
+
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: analyze '%s' exhausted %d retries. Continuing.",
+              feedback.argument.c_str(),
+              MAX_ANALYZE_RETRIES);
+            resetAnalyzeRetryState();
+          }
+
           if (isFindPosePersonNotFound(feedback))
           {
             ++find_pose_retry_count_;
@@ -3129,6 +3171,12 @@ private:
 
           if (normalizeText(feedback.action) == "find_object") {
             resetFindObjectRetryState();
+          }
+
+          if (normalizeText(feedback.action) == "analyze" ||
+              normalizeText(feedback.action) == "analyze_objects" ||
+              normalizeText(feedback.action) == "analyze_object") {
+            resetAnalyzeRetryState();
           }
 
           if (normalizeText(feedback.action) == "find_pose") {
@@ -3336,6 +3384,9 @@ private:
   static constexpr int MAX_FIND_OBJECT_RETRIES = 2;
   int find_object_retry_count_{0};
   std::string find_object_retry_argument_;
+  static constexpr int MAX_ANALYZE_RETRIES = 2;
+  int analyze_retry_count_{0};
+  std::string analyze_retry_argument_;
   // Reintento unico para "Justina take <objeto>" antes de saltar al siguiente paso.
   bool take_retry_pending_{false};
   std::string take_retry_instruction_;
