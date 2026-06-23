@@ -187,6 +187,13 @@ private:
     WAIT_TAKE_RETRY
   };
 
+  enum class DropApproachRetryState : uint8_t
+  {
+    IDLE,
+    WAIT_APPROACH,
+    WAIT_DROP_RETRY
+  };
+
   enum class PersonApproachRecoveryState : uint8_t
   {
     IDLE,
@@ -1980,6 +1987,12 @@ private:
     return normalizeText(feedback.action) == "take";
   }
 
+  bool isDropAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "drop";
+  }
+
   bool isApproachAction(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
   {
@@ -2090,10 +2103,23 @@ private:
            normalizeText(feedback.worker_result) == "pose_out_of_range";
   }
 
+  bool isDropPoseOutOfRangeFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return isDropAction(feedback) &&
+           normalizeText(feedback.worker_result) == "pose_out_of_range";
+  }
+
   bool isJustinaTakeInstruction(const std::string & instruction) const
   {
     const std::string normalized = normalizeText(instruction);
     return normalized.rfind("justina take ", 0U) == 0U;
+  }
+
+  bool isJustinaDropInstruction(const std::string & instruction) const
+  {
+    const std::string normalized = normalizeText(instruction);
+    return normalized.rfind("justina drop ", 0U) == 0U;
   }
 
   std::string takeRetryInstructionKey(
@@ -2109,6 +2135,31 @@ private:
     }
 
     return "";
+  }
+
+  std::string dropRetryInstructionKey(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Conservamos la instruccion completa original ("Justina drop cutlery_1")
+    // para reintentar el mismo objeto despues de acercarnos a safe_drop_1.
+    const std::string current_instruction = getCurrentInstruction();
+    if (isJustinaDropInstruction(current_instruction)) {
+      return current_instruction;
+    }
+
+    if (isDropAction(feedback) && !feedback.argument.empty()) {
+      return "Justina drop " + feedback.argument;
+    }
+
+    return "";
+  }
+
+  void resetDropApproachRecovery()
+  {
+    drop_retry_pending_ = false;
+    drop_retry_instruction_.clear();
+    drop_approach_retry_state_ = DropApproachRetryState::IDLE;
+    drop_approach_retry_argument_.clear();
   }
 
   bool handleTakeFailureRetry(
@@ -2224,6 +2275,105 @@ private:
 
       take_approach_retry_state_ = TakeApproachRetryState::IDLE;
       take_approach_retry_argument_.clear();
+      return false;
+    }
+
+    return false;
+  }
+
+  bool handleDropFailureRetry(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Drop solo pide recuperacion cuando la marca de manipulacion queda fuera
+    // de rango. En ese caso insertamos approach safe_drop_1 y reintentamos una
+    // vez el drop original.
+    if (!isDropPoseOutOfRangeFailure(feedback)) {
+      return false;
+    }
+
+    const std::string instruction_key = dropRetryInstructionKey(feedback);
+    if (instruction_key.empty()) {
+      return false;
+    }
+
+    const std::string normalized_key = normalizeText(instruction_key);
+    if (drop_retry_pending_ &&
+        normalizeText(drop_retry_instruction_) == normalized_key)
+    {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[DropRetry] Retry also failed for '%s'; continuing with normal failure path",
+        instruction_key.c_str());
+      resetDropApproachRecovery();
+      return false;
+    }
+
+    drop_retry_pending_ = true;
+    drop_retry_instruction_ = instruction_key;
+    drop_approach_retry_state_ = DropApproachRetryState::WAIT_APPROACH;
+    drop_approach_retry_argument_ = "safe_drop_1";
+
+    const std::string approach_instruction =
+      "Justina approach " + drop_approach_retry_argument_;
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[DropRetry] Drop target is out of range; injecting approach before retry: '%s'",
+      approach_instruction.c_str());
+
+    if (!sayText("I need to get closer to the drop point first.")) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[DropRetry] could not announce approach recovery through TTS");
+    }
+
+    return dispatchOverrideInstruction(approach_instruction);
+  }
+
+  bool handleDropApproachRecovery(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Pequena maquina de estados del retry:
+    // WAIT_APPROACH espera que termine approach safe_drop_1.
+    // WAIT_DROP_RETRY espera el resultado del drop original reinyectado.
+    if (drop_approach_retry_state_ == DropApproachRetryState::IDLE) {
+      return false;
+    }
+
+    const std::string retry_argument =
+      normalizeText(drop_approach_retry_argument_);
+
+    if (drop_approach_retry_state_ == DropApproachRetryState::WAIT_APPROACH) {
+      if (!isApproachAction(feedback) ||
+          normalizeText(feedback.argument) != retry_argument)
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[DropRetry] Approach recovery failed for '%s'; continuing with normal failure path",
+          drop_approach_retry_argument_.c_str());
+        resetDropApproachRecovery();
+        return false;
+      }
+
+      drop_approach_retry_state_ = DropApproachRetryState::WAIT_DROP_RETRY;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[DropRetry] Approach completed; retrying original drop: '%s'",
+        drop_retry_instruction_.c_str());
+      return dispatchOverrideInstruction(drop_retry_instruction_);
+    }
+
+    if (drop_approach_retry_state_ == DropApproachRetryState::WAIT_DROP_RETRY) {
+      if (!isDropAction(feedback)) {
+        return false;
+      }
+
+      drop_approach_retry_state_ = DropApproachRetryState::IDLE;
+      drop_approach_retry_argument_.clear();
       return false;
     }
 
@@ -2964,6 +3114,11 @@ private:
           break;
         }
 
+        if (handleDropApproachRecovery(feedback))
+        {
+          break;
+        }
+
         if (handlePersonApproachRecovery(feedback))
         {
           break;
@@ -3108,6 +3263,10 @@ private:
             break;
           }
 
+          if (handleDropFailureRetry(feedback)) {
+            break;
+          }
+
           const std::string status_name = executionStatusName(feedback.status);
           std::string reason;
           if (!feedback.failure_reason.empty() &&
@@ -3216,6 +3375,10 @@ private:
             take_approach_retry_state_ = TakeApproachRetryState::IDLE;
             take_approach_retry_argument_.clear();
             resetTakePnpRecovery();
+          }
+
+          if (isDropAction(feedback)) {
+            resetDropApproachRecovery();
           }
 
           updateInstructionPointStateFromGoTo(feedback);
@@ -3394,6 +3557,12 @@ private:
   // la base con approach y luego reintenta el mismo take una sola vez.
   TakeApproachRetryState take_approach_retry_state_{TakeApproachRetryState::IDLE};
   std::string take_approach_retry_argument_;
+  // Recuperacion equivalente para drop: si la marca de manipulacion esta fuera
+  // de rango, approach usa safe_drop_1 y luego se reintenta el drop original.
+  bool drop_retry_pending_{false};
+  std::string drop_retry_instruction_;
+  DropApproachRetryState drop_approach_retry_state_{DropApproachRetryState::IDLE};
+  std::string drop_approach_retry_argument_;
   // Recuperacion PNP: ante cualquier fallo de take, ejecuta approach +
   // find_object + take hasta MAX_TAKE_PNP_RECOVERY_ATTEMPTS veces; si se
   // agota, el objeto se ignora y el plan continua.
