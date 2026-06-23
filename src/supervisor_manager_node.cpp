@@ -458,9 +458,42 @@ private:
     const auto last = value.find_last_not_of(" \t\n\r");
     value = value.substr(first, last - first + 1);
 
+    auto strip_leading_articles = [](std::string token) {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        for (const char * prefix : {"the ", "a ", "an ", "the_", "a_", "an_"}) {
+          const std::string article(prefix);
+          if (token.rfind(article, 0U) == 0U && token.size() > article.size()) {
+            token = token.substr(article.size());
+            changed = true;
+            break;
+          }
+        }
+      }
+      return token;
+    };
+
+    value = strip_leading_articles(value);
     std::replace(value.begin(), value.end(), ' ', '_');
     std::replace(value.begin(), value.end(), '-', '_');
-    return value;
+    return strip_leading_articles(value);
+  }
+
+  void addKnownLocationToken(const std::string & raw_location)
+  {
+    const std::string location = normalizeKnowledgeToken(raw_location);
+    if (location.empty()) {
+      return;
+    }
+
+    known_locations_.insert(location);
+
+    std::string compact = location;
+    compact.erase(std::remove(compact.begin(), compact.end(), '_'), compact.end());
+    if (!compact.empty()) {
+      known_locations_.insert(compact);
+    }
   }
 
   bool loadKnownLocations()
@@ -486,10 +519,7 @@ private:
 
       for (const auto & category : root) {
         if (category.first.IsScalar()) {
-          const std::string location = normalizeKnowledgeToken(category.first.as<std::string>());
-          if (!location.empty()) {
-            known_locations_.insert(location);
-          }
+          addKnownLocationToken(category.first.as<std::string>());
         }
 
         if (!category.second.IsSequence()) {
@@ -501,10 +531,7 @@ private:
             continue;
           }
 
-          const std::string location = normalizeKnowledgeToken(item.as<std::string>());
-          if (!location.empty()) {
-            known_locations_.insert(location);
-          }
+          addKnownLocationToken(item.as<std::string>());
         }
       }
 
@@ -530,6 +557,15 @@ private:
     return destination == "unknown" ||
            destination == "user" ||
            destination == "person_recipient";
+  }
+
+  bool isSemanticLocationField(const std::string & field_name) const
+  {
+    return field_name == "destination" ||
+           field_name == "source" ||
+           field_name == "location" ||
+           field_name == "recipient_location" ||
+           field_name == "destination_location";
   }
 
   bool textMentionsUnknownDestination(const std::string & text) const
@@ -604,24 +640,25 @@ private:
     SemanticValidationResult & result)
   {
     if (value.is_object()) {
-      const auto destination = value.find("destination");
-      if (destination != value.end() && destination->is_string()) {
-        const std::string raw_destination = destination->get<std::string>();
-        const std::string normalized_destination = normalizeKnowledgeToken(raw_destination);
-
-        if (normalized_destination == "unknown") {
-          result.valid = false;
-          result.unknown_destination = true;
-        } else if (!known_locations_.empty() &&
-                   !isSpecialSemanticDestination(normalized_destination) &&
-                   known_locations_.find(normalized_destination) == known_locations_.end())
-        {
-          result.valid = false;
-          result.invalid_destinations.push_back(raw_destination);
-        }
-      }
-
       for (const auto & item : value.items()) {
+        if (isSemanticLocationField(item.key()) && item.value().is_string()) {
+          const std::string raw_location = item.value().get<std::string>();
+          const std::string normalized_location = normalizeKnowledgeToken(raw_location);
+
+          if (item.key() == "destination" && normalized_location == "unknown") {
+            result.valid = false;
+            result.unknown_destination = true;
+          } else if (!normalized_location.empty() &&
+                     normalized_location != "unknown" &&
+                     !isSpecialSemanticDestination(normalized_location) &&
+                     !known_locations_.empty() &&
+                     known_locations_.find(normalized_location) == known_locations_.end())
+          {
+            result.valid = false;
+            result.invalid_destinations.push_back(raw_location);
+          }
+        }
+
         validateJsonDestinations(item.value(), result);
       }
       return;
