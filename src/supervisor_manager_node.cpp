@@ -172,7 +172,7 @@ private:
 
   enum class FollowGiftState : uint8_t
   {
-    // Sub-FSM local para el caso say instruct_follow_person
+    // Sub-FSM local para follow dinamico disparado por say instruct_follow_*,
     // sin consumir pasos fijos del plan CLIPS.
     IDLE,
     WAIT_FOLLOW_ENABLE,
@@ -1186,7 +1186,7 @@ private:
     follow_gift_state_ = next_state;
     RCLCPP_INFO(
       this->get_logger(),
-      "[FollowGift] dispatching '%s'; next_state=%u",
+      "[FollowSequence] dispatching '%s'; next_state=%u",
       instruction.c_str(),
       static_cast<unsigned int>(follow_gift_state_));
     return dispatchOverrideInstruction(instruction);
@@ -1195,17 +1195,27 @@ private:
   bool handleFollowGiftSequence(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
-    // Punto de entrada: cuando termina "say instruct_follow_person", el plan deja
+    // Punto de entrada: cuando termina un say instruct_follow_*, el plan deja
     // el control al manager para decidir dinamicamente segun lo que escuche.
+    const bool is_follow_gift_trigger =
+      feedbackMatches(feedback, "say", "instruct_follow_person");
+    const bool is_follow_only_trigger =
+      feedbackMatches(feedback, "say", "instruct_follow_only");
     if (follow_gift_state_ == FollowGiftState::IDLE &&
-        feedbackMatches(feedback, "say", "instruct_follow_person") &&
+        (is_follow_gift_trigger || is_follow_only_trigger) &&
         isSuccessfulFeedback(feedback))
     {
+      follow_drop_after_stop_ = is_follow_gift_trigger;
       const std::string answer = waitForFollowGiftAnswer(true);
       if (answer == "stop") {
+        if (!follow_drop_after_stop_) {
+          sayText("Understood. I will not start following.");
+          follow_drop_after_stop_ = false;
+          return false;
+        }
         sayText("Understood. I am ready to leave the gift.");
         return dispatchFollowGiftInstruction(
-          "Justina drop gift",
+          "Justina drop floor",
           FollowGiftState::WAIT_DROP_GIFT);
       }
 
@@ -1238,11 +1248,16 @@ private:
 
         if (!isSuccessfulFeedback(feedback)) {
           follow_gift_state_ = FollowGiftState::IDLE;
+          follow_drop_after_stop_ = false;
           return false;
         }
 
         waitForFollowGiftStop();
-        sayText("Understood. I am ready to leave the gift.");
+        if (follow_drop_after_stop_) {
+          sayText("Understood. I am ready to leave the gift.");
+        } else {
+          sayText("Understood. I will stop following you.");
+        }
 
         return dispatchFollowGiftInstruction(
           "Justina follow disable",
@@ -1251,13 +1266,21 @@ private:
 
       case FollowGiftState::WAIT_FOLLOW_DISABLE:
       {
-        // Al detener el seguimiento, se encadena la entrega del regalo.
+        // Al detener el seguimiento, la variante gift encadena drop floor;
+        // la variante only vuelve al flujo normal del plan.
         if (!feedbackMatches(feedback, "follow", "disable")) {
           return false;
         }
 
         if (!isSuccessfulFeedback(feedback)) {
           follow_gift_state_ = FollowGiftState::IDLE;
+          follow_drop_after_stop_ = false;
+          return false;
+        }
+
+        if (!follow_drop_after_stop_) {
+          follow_gift_state_ = FollowGiftState::IDLE;
+          follow_drop_after_stop_ = false;
           return false;
         }
 
@@ -1268,13 +1291,14 @@ private:
 
       case FollowGiftState::WAIT_DROP_GIFT:
       {
-        // La secuencia dinamica termina despues de ejecutar drop gift; desde aqui
+        // La secuencia dinamica termina despues de ejecutar drop floor; desde aqui
         // el manager vuelve al flujo normal del plan.
         if (!feedbackMatches(feedback, "drop", "floor")) {
           return false;
         }
 
         follow_gift_state_ = FollowGiftState::IDLE;
+        follow_drop_after_stop_ = false;
         return false;
       }
 
@@ -3581,11 +3605,13 @@ private:
   std::string person_preventive_refined_approach_argument_;
   int person_find_pose_retry_count_{0};
 
-  // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
-  // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
+  // Secuencia dinamica para seguir a una persona:
+  // say instruct_follow_person -> follow -> stop -> drop floor.
+  // say instruct_follow_only -> follow -> stop.
   static constexpr int MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS = 3;
   static constexpr int FOLLOW_GIFT_STOP_REPROMPT_EVERY_ATTEMPTS = 3;
   FollowGiftState follow_gift_state_{FollowGiftState::IDLE};
+  bool follow_drop_after_stop_{false};
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
