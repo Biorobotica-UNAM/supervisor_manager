@@ -445,7 +445,7 @@ private:
       return "";
     }
 
-    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 2] Semantic CD: \"%s\"", semantic.c_str());
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 2] Semantic response: \"%s\"", semantic.c_str());
     return semantic;
   }
 
@@ -721,17 +721,40 @@ private:
     return validation.invalid_destinations.front();
   }
 
+  bool semanticHasGoalsPayload(const std::string & semantic) const
+  {
+    try {
+      const auto parsed = nlohmann::json::parse(semantic);
+      return parsed.is_object() &&
+             parsed.contains("goals") &&
+             parsed["goals"].is_array();
+    } catch (const nlohmann::json::exception &) {
+      return false;
+    }
+  }
+
   std::string stepToClips(const std::string & semantic)
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] Converting to CLIPS: \"%s\"", semantic.c_str());
-    const std::string clips = planning_->primitiveToClips(semantic);
+    const bool use_goals_to_clips = semanticHasGoalsPayload(semantic);
+    const std::string clips = use_goals_to_clips
+      ? planning_->goalsToClips(semantic)
+      : planning_->primitiveToClips(semantic);
 
-    if (clips.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 3] primitiveToClips returned empty");
+    if (clips.empty() || clips.rfind("ERROR", 0U) == 0U) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[Pipeline][Step 3] %s failed: \"%s\"",
+        use_goals_to_clips ? "goalsToClips" : "primitiveToClips",
+        clips.c_str());
       return "";
     }
 
-    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] CLIPS facts: \"%s\"", clips.c_str());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 3] %s response: \"%s\"",
+      use_goals_to_clips ? "goalsToClips" : "primitiveToClips",
+      clips.c_str());
     return clips;
   }
 
@@ -872,7 +895,7 @@ private:
 
     const std::string clips = stepToClips(semantic);
     if (clips.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 3: primitiveToClips returned empty");
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 3: CLIPS conversion failed");
       return false;
     }
 
@@ -1073,6 +1096,22 @@ private:
            normalizeText(feedback.argument) == argument;
   }
 
+  std::string followDestinationFromTrigger(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    if (normalizeText(feedback.action) != "say") {
+      return "";
+    }
+
+    static const std::string kPrefix = "instruct_follow_to_";
+    const std::string argument = normalizeKnowledgeToken(feedback.argument);
+    if (argument.rfind(kPrefix, 0U) != 0U || argument.size() <= kPrefix.size()) {
+      return "";
+    }
+
+    return argument.substr(kPrefix.size());
+  }
+
   bool answerHasStop(const std::string & text) const
   {
     const std::string answer = normalizeConfirmationCommand(text);
@@ -1179,6 +1218,73 @@ private:
     }
   }
 
+  bool waitForFollowDestination(const std::string & destination)
+  {
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(FOLLOW_DESTINATION_TIMEOUT_SEC);
+    int poll_count = 0;
+
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      double robot_x = 0.0;
+      double robot_y = 0.0;
+      std::string error_message;
+      if (!lookupFramePositionInMap(base_frame_, robot_x, robot_y, error_message)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[FollowSequence] cannot monitor destination '%s': %s",
+          destination.c_str(),
+          error_message.c_str());
+      } else {
+        double goal_x = 0.0;
+        double goal_y = 0.0;
+        if (!lookupFramePositionInMap(destination, goal_x, goal_y, error_message)) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[FollowSequence] cannot monitor destination '%s': %s",
+            destination.c_str(),
+            error_message.c_str());
+        } else {
+          const double dx = goal_x - robot_x;
+          const double dy = goal_y - robot_y;
+          const double distance_m = std::sqrt(dx * dx + dy * dy);
+          if (distance_m <= go_to_success_distance_tolerance_m_) {
+            RCLCPP_INFO(
+              this->get_logger(),
+              "[FollowSequence] destination '%s' reached while following: %.2f m <= %.2f m",
+              destination.c_str(),
+              distance_m,
+              go_to_success_distance_tolerance_m_);
+            return true;
+          }
+
+          if (poll_count % FOLLOW_DESTINATION_LOG_EVERY_POLLS == 0) {
+            RCLCPP_INFO(
+              this->get_logger(),
+              "[FollowSequence] following to '%s': %.2f m remaining",
+              destination.c_str(),
+              distance_m);
+          }
+        }
+      }
+
+      ++poll_count;
+      rclcpp::sleep_for(std::chrono::milliseconds(FOLLOW_DESTINATION_POLL_MS));
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[FollowSequence] timeout monitoring follow destination '%s'",
+      destination.c_str());
+    return false;
+  }
+
+  void resetFollowGiftSequence()
+  {
+    follow_gift_state_ = FollowGiftState::IDLE;
+    follow_drop_after_stop_ = false;
+    follow_destination_.clear();
+  }
+
   bool dispatchFollowGiftInstruction(
     const std::string & instruction,
     FollowGiftState next_state)
@@ -1201,16 +1307,19 @@ private:
       feedbackMatches(feedback, "say", "instruct_follow_person");
     const bool is_follow_only_trigger =
       feedbackMatches(feedback, "say", "instruct_follow_only");
+    const std::string triggered_follow_destination = followDestinationFromTrigger(feedback);
+    const bool is_follow_destination_trigger = !triggered_follow_destination.empty();
     if (follow_gift_state_ == FollowGiftState::IDLE &&
-        (is_follow_gift_trigger || is_follow_only_trigger) &&
+        (is_follow_gift_trigger || is_follow_only_trigger || is_follow_destination_trigger) &&
         isSuccessfulFeedback(feedback))
     {
       follow_drop_after_stop_ = is_follow_gift_trigger;
+      follow_destination_ = triggered_follow_destination;
       const std::string answer = waitForFollowGiftAnswer(true);
       if (answer == "stop") {
         if (!follow_drop_after_stop_) {
           sayText("Understood. I will not start following.");
-          follow_drop_after_stop_ = false;
+          resetFollowGiftSequence();
           return false;
         }
         sayText("Understood. I am ready to leave the gift.");
@@ -1220,11 +1329,23 @@ private:
       }
 
       if (answer.empty()) {
-        sayText("I could not understand the instruction. I will start following you.");
+        if (follow_destination_.empty()) {
+          sayText("I could not understand the instruction. I will start following you.");
+        } else {
+          sayText(
+            "I could not understand the instruction. I will start following you to " +
+            makeSpeechFriendly(follow_destination_) + ".");
+        }
       }
 
       if (answer == "follow") {
-        sayText("Understood. I will start following you now.");
+        if (follow_destination_.empty()) {
+          sayText("Understood. I will start following you now.");
+        } else {
+          sayText(
+            "Understood. I will follow you to " +
+            makeSpeechFriendly(follow_destination_) + ".");
+        }
       }
 
       return dispatchFollowGiftInstruction(
@@ -1247,15 +1368,28 @@ private:
         }
 
         if (!isSuccessfulFeedback(feedback)) {
-          follow_gift_state_ = FollowGiftState::IDLE;
-          follow_drop_after_stop_ = false;
+          resetFollowGiftSequence();
           return false;
         }
 
-        waitForFollowGiftStop();
+        if (!follow_destination_.empty()) {
+          const bool arrived = waitForFollowDestination(follow_destination_);
+          if (arrived) {
+            sayText(
+              "We have arrived at " + makeSpeechFriendly(follow_destination_) +
+              ". I will stop following you.");
+          } else {
+            sayText(
+              "I could not confirm arrival at " + makeSpeechFriendly(follow_destination_) +
+              ". I will stop following you.");
+          }
+        } else {
+          waitForFollowGiftStop();
+        }
+
         if (follow_drop_after_stop_) {
           sayText("Understood. I am ready to leave the gift.");
-        } else {
+        } else if (follow_destination_.empty()) {
           sayText("Understood. I will stop following you.");
         }
 
@@ -1273,14 +1407,12 @@ private:
         }
 
         if (!isSuccessfulFeedback(feedback)) {
-          follow_gift_state_ = FollowGiftState::IDLE;
-          follow_drop_after_stop_ = false;
+          resetFollowGiftSequence();
           return false;
         }
 
         if (!follow_drop_after_stop_) {
-          follow_gift_state_ = FollowGiftState::IDLE;
-          follow_drop_after_stop_ = false;
+          resetFollowGiftSequence();
           return false;
         }
 
@@ -1297,8 +1429,7 @@ private:
           return false;
         }
 
-        follow_gift_state_ = FollowGiftState::IDLE;
-        follow_drop_after_stop_ = false;
+        resetFollowGiftSequence();
         return false;
       }
 
@@ -3608,10 +3739,15 @@ private:
   // Secuencia dinamica para seguir a una persona:
   // say instruct_follow_person -> follow -> stop -> drop floor.
   // say instruct_follow_only -> follow -> stop.
+  // say instruct_follow_to_<dest> -> follow -> monitor dest -> stop.
   static constexpr int MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS = 3;
   static constexpr int FOLLOW_GIFT_STOP_REPROMPT_EVERY_ATTEMPTS = 3;
+  static constexpr int FOLLOW_DESTINATION_POLL_MS = 500;
+  static constexpr int FOLLOW_DESTINATION_LOG_EVERY_POLLS = 10;
+  static constexpr int FOLLOW_DESTINATION_TIMEOUT_SEC = 180;
   FollowGiftState follow_gift_state_{FollowGiftState::IDLE};
   bool follow_drop_after_stop_{false};
+  std::string follow_destination_;
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
