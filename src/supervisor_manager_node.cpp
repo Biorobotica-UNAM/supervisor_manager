@@ -39,7 +39,9 @@ using namespace std::chrono_literals;
 class SupervisorManagerNode : public rclcpp::Node
 {
 public:
-  explicit SupervisorManagerNode(bool natural_language_planning)
+  explicit SupervisorManagerNode(
+    bool natural_language_planning,
+    std::optional<bool> ask_data_confirmation_override = std::nullopt)
   : Node("supervisor_manager_node"),
     tf_buffer_(this->get_clock()),
     tf_listener_(tf_buffer_),
@@ -54,12 +56,29 @@ public:
     this->declare_parameter<std::string>("map_frame", "map");
     this->declare_parameter<std::string>("base_frame", "base_link");
     this->declare_parameter<double>("go_to_success_distance_tolerance_m", 0.75);
+    this->declare_parameter<bool>("ask_data_confirmation_enabled", true);
 
     this->get_parameter("map_frame", map_frame_);
     this->get_parameter("base_frame", base_frame_);
     this->get_parameter(
       "go_to_success_distance_tolerance_m",
       go_to_success_distance_tolerance_m_);
+    this->get_parameter(
+      "ask_data_confirmation_enabled",
+      ask_data_confirmation_enabled_);
+
+    if (ask_data_confirmation_override.has_value()) {
+      ask_data_confirmation_enabled_ = *ask_data_confirmation_override;
+      this->set_parameter(
+        rclcpp::Parameter(
+          "ask_data_confirmation_enabled",
+          ask_data_confirmation_enabled_));
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "ask_data_confirmation_enabled=%s",
+      ask_data_confirmation_enabled_ ? "true" : "false");
 
     // --- Entradas ROS ---
     // /system/status indica si los modulos minimos estan disponibles.
@@ -1730,6 +1749,16 @@ private:
     pending_confirmation_listen_argument_ = feedback.argument;
     pending_confirmation_value_ = value;
     ++confirmation_attempts_;
+
+    if (!ask_data_confirmation_enabled_) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Confirmation] Accepting '%s'='%s' without spoken confirmation because ask_data_confirmation_enabled=false",
+        pending_confirmation_listen_argument_.c_str(),
+        pending_confirmation_value_.c_str());
+      clearDataConfirmation();
+      return false;
+    }
 
     const std::string phrase = confirmationPhrase(
       pending_confirmation_listen_argument_,
@@ -3657,6 +3686,7 @@ private:
   // false: usa un plan CLIPS ya definido. true: pide una orden hablada y genera
   // hechos CLIPS antes de planear.
   bool natural_language_planning_{false};
+  bool ask_data_confirmation_enabled_{true};
   std::string map_frame_{"map"};
   std::string base_frame_{"base_link"};
   double go_to_success_distance_tolerance_m_{0.75};
@@ -3787,17 +3817,19 @@ bool parseBooleanValue(const std::string & value, bool & out)
   return false;
 }
 
-bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
+std::optional<bool> getBooleanArgFromArgv(
+  int argc,
+  char ** argv,
+  const std::string & key)
 {
   // Se parsea manualmente porque este nodo puede correrse con ros2 run o desde
-  // launch; soporta natural_language_planning=true y natural_language_planning:=true.
+  // launch; soporta key=true y key:=true.
   bool value = false;
   bool found = false;
 
   for (int i = 1; i < argc; ++i)
   {
     const std::string arg(argv[i]);
-    const std::string key = "natural_language_planning";
 
     if (arg.rfind(key + "=", 0) == 0 || arg.rfind(key + ":=", 0) == 0)
     {
@@ -3809,7 +3841,8 @@ bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
       if (!parsed) {
         RCLCPP_WARN(
           rclcpp::get_logger("supervisor_manager_node"),
-          "Invalid value for natural_language_planning: '%s'. Using default false.",
+          "Invalid value for %s: '%s'. Ignoring command-line override.",
+          key.c_str(),
           arg.c_str());
       } else {
         found = true;
@@ -3822,7 +3855,8 @@ bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
       if (!parseBooleanValue(argv[i + 2], value)) {
         RCLCPP_WARN(
           rclcpp::get_logger("supervisor_manager_node"),
-          "Invalid value for natural_language_planning: '%s'. Using default false.",
+          "Invalid value for %s: '%s'. Ignoring command-line override.",
+          key.c_str(),
           argv[i + 2]);
       } else {
         found = true;
@@ -3831,16 +3865,31 @@ bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
     }
   }
 
-  return found ? value : false;
+  if (!found) {
+    return std::nullopt;
+  }
+
+  return value;
+}
+
+bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
+{
+  const std::optional<bool> value =
+    getBooleanArgFromArgv(argc, argv, "natural_language_planning");
+  return value.value_or(false);
 }
 }  // namespace
 
 int main(int argc, char ** argv)
 {
   const bool natural_language_planning = getNaturalLanguagePlanningFromArgv(argc, argv);
+  const std::optional<bool> ask_data_confirmation_override =
+    getBooleanArgFromArgv(argc, argv, "ask_data_confirmation_enabled");
   rclcpp::init(argc, argv);
 
-  auto node = std::make_shared<SupervisorManagerNode>(natural_language_planning);
+  auto node = std::make_shared<SupervisorManagerNode>(
+    natural_language_planning,
+    ask_data_confirmation_override);
 
   rclcpp::executors::MultiThreadedExecutor exec(
     rclcpp::ExecutorOptions(),

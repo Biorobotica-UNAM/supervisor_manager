@@ -3,6 +3,9 @@
     <arg    name="namespace"
             default="supervisor"
             description="Top-level namespace for all supervisor nodes"/>  
+    <arg    name="ask_data_confirmation_enabled"
+            default="true"
+            description="Confirm values captured by ask_* + listen before continuing"/>
 
     <group>
         <push-ros-namespace namespace="$(var namespace)"/>
@@ -33,6 +36,7 @@
             exec="supervisor_manager_node"
             name="supervisor_manager_node"
             output="screen">
+            <param name="ask_data_confirmation_enabled" value="$(var ask_data_confirmation_enabled)"/>
         </node-->
     </group>
 </launch>
