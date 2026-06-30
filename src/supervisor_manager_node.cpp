@@ -1492,6 +1492,76 @@ private:
     return action == "listen";
   }
 
+  bool isListenContinueAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return isListenAction(feedback) && normalizeText(feedback.argument) == "continue";
+  }
+
+  bool listenContinueHeard(const std::string & worker_result) const
+  {
+    std::string normalized = normalizeConfirmationCommand(worker_result);
+    const std::string prefix = "continue ";
+    if (normalized.rfind(prefix, 0U) == 0U) {
+      normalized = normalized.substr(prefix.size());
+    }
+
+    return normalized == "continue" ||
+           normalized == "robot continue" ||
+           normalized == "please continue" ||
+           normalized.find(" continue") != std::string::npos;
+  }
+
+  bool handleListenContinueGate(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (!isListenContinueAction(feedback)) {
+      return false;
+    }
+
+    if (feedback.approved &&
+        feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS &&
+        listenContinueHeard(feedback.worker_result))
+    {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[ListenContinue] Heard continue in worker_result='%s'; resuming normal plan",
+        feedback.worker_result.c_str());
+      listen_continue_retry_count_ = 0;
+      return false;
+    }
+
+    ++listen_continue_retry_count_;
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[ListenContinue] Waiting for 'continue' (retry #%d). worker='%s' approved=%s status=%u reason='%s'",
+      listen_continue_retry_count_,
+      feedback.worker_result.c_str(),
+      feedback.approved ? "true" : "false",
+      static_cast<unsigned int>(feedback.status),
+      feedback.failure_reason.c_str());
+
+    if (listen_continue_retry_count_ == 1 ||
+        listen_continue_retry_count_ % LISTEN_CONTINUE_REPROMPT_EVERY_RETRIES == 0)
+    {
+      if (!sayText("Please say continue when you are ready.")) {
+        RCLCPP_WARN(this->get_logger(), "[ListenContinue] could not reprompt through TTS");
+      }
+    }
+
+    publishRetryCommand();
+    publishAllowNextCycle();
+    return true;
+  }
+
+  void resetListenContinueGate(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (!isListenContinueAction(feedback)) {
+      listen_continue_retry_count_ = 0;
+    }
+  }
+
   bool isFullListenArgument(const std::string & argument) const
   {
     // Listen en modo FULL guarda en world state y usa el formato:
@@ -3275,6 +3345,13 @@ private:
 			corrective_pending_ = false;
 		}
 
+        if (handleListenContinueGate(feedback))
+        {
+          break;
+        }
+
+        resetListenContinueGate(feedback);
+
         if (isDoorClosedCheckFailure(feedback))
         {
           // Closed door is recoverable by human intervention, so do not announce
@@ -3726,6 +3803,8 @@ private:
   // Solo un bumper activo acepta detener la navegacion permanentemente.
   int nav_retry_count_{0};
   int find_pose_retry_count_{0};
+  static constexpr int LISTEN_CONTINUE_REPROMPT_EVERY_RETRIES = 3;
+  int listen_continue_retry_count_{0};
   static constexpr int MAX_FIND_PERSON_ANYBODY_RETRIES = 2;
   int find_person_anybody_retry_count_{0};
   std::string find_person_anybody_retry_argument_;
