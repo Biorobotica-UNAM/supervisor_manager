@@ -1527,8 +1527,14 @@ private:
         this->get_logger(),
         "[ListenContinue] Heard continue in worker_result='%s'; resuming normal plan",
         feedback.worker_result.c_str());
-      listen_continue_retry_count_ = 0;
+      resetListenContinueGateState();
       return false;
+    }
+
+    if (!listen_continue_wait_active_) {
+      listen_continue_wait_active_ = true;
+      listen_continue_deadline_ =
+        this->now() + rclcpp::Duration::from_seconds(LISTEN_CONTINUE_TIMEOUT_SEC);
     }
 
     ++listen_continue_retry_count_;
@@ -1540,6 +1546,21 @@ private:
       feedback.approved ? "true" : "false",
       static_cast<unsigned int>(feedback.status),
       feedback.failure_reason.c_str());
+
+    if (this->now() >= listen_continue_deadline_) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[ListenContinue] Timed out after %d seconds without hearing continue; advancing plan",
+        LISTEN_CONTINUE_TIMEOUT_SEC);
+
+      if (!sayText("I did not hear continue after three minutes. I will continue with the task.")) {
+        RCLCPP_WARN(this->get_logger(), "[ListenContinue] could not announce timeout through TTS");
+      }
+
+      resetListenContinueGateState();
+      publishAllowNextCycle();
+      return true;
+    }
 
     if (listen_continue_retry_count_ == 1 ||
         listen_continue_retry_count_ % LISTEN_CONTINUE_REPROMPT_EVERY_RETRIES == 0)
@@ -1558,8 +1579,15 @@ private:
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
     if (!isListenContinueAction(feedback)) {
-      listen_continue_retry_count_ = 0;
+      resetListenContinueGateState();
     }
+  }
+
+  void resetListenContinueGateState()
+  {
+    listen_continue_retry_count_ = 0;
+    listen_continue_wait_active_ = false;
+    listen_continue_deadline_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   }
 
   bool isFullListenArgument(const std::string & argument) const
@@ -1964,6 +1992,18 @@ private:
     const std::string action = normalizeText(feedback.action);
     const std::string reason = normalizeText(feedback.failure_reason);
     return (action == "go_to" || action == "goto") && reason == "navigation_failed";
+  }
+
+  bool isNavigationLocationNotFoundFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    if (!isNavigationFailure(feedback)) {
+      return false;
+    }
+
+    const std::string worker = normalizeText(feedback.worker_result);
+    return worker.find("location") != std::string::npos &&
+           worker.find("not found") != std::string::npos;
   }
 
   bool isBumperFailure(
@@ -3505,6 +3545,18 @@ private:
 
           // Navigation failures retry indefinitely until goal is reached.
           // The only accepted stop is a bumper trigger.
+          if (isNavigationLocationNotFoundFailure(feedback))
+          {
+            nav_retry_count_ = 0;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: go_to '%s' references an unknown location; skipping retry. worker='%s'",
+              feedback.argument.c_str(),
+              feedback.worker_result.c_str());
+            announceFailureAndContinue(feedback, "navigation_failed - location not found");
+            break;
+          }
+
           if (isNavigationFailure(feedback) && !isBumperFailure(feedback))
           {
             ++nav_retry_count_;
@@ -3803,8 +3855,11 @@ private:
   // Solo un bumper activo acepta detener la navegacion permanentemente.
   int nav_retry_count_{0};
   int find_pose_retry_count_{0};
+  static constexpr int LISTEN_CONTINUE_TIMEOUT_SEC = 180;
   static constexpr int LISTEN_CONTINUE_REPROMPT_EVERY_RETRIES = 3;
   int listen_continue_retry_count_{0};
+  bool listen_continue_wait_active_{false};
+  rclcpp::Time listen_continue_deadline_{0, 0, RCL_ROS_TIME};
   static constexpr int MAX_FIND_PERSON_ANYBODY_RETRIES = 2;
   int find_person_anybody_retry_count_{0};
   std::string find_person_anybody_retry_argument_;
