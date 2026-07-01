@@ -13,6 +13,8 @@
 #include <talker_interfaces/srv/talk.hpp>
 #include <planning_tools/Planning.hpp>
 
+#include "supervisor_manager/pnp_recovery.hpp"
+
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nlohmann/json.hpp>
 #include <tf2/exceptions.hpp>
@@ -56,7 +58,10 @@ public:
     this->declare_parameter<std::string>("map_frame", "map");
     this->declare_parameter<std::string>("base_frame", "base_link");
     this->declare_parameter<double>("go_to_success_distance_tolerance_m", 0.75);
-    this->declare_parameter<bool>("ask_data_confirmation_enabled", true);
+    this->declare_parameter<bool>("ask_data_confirmation_enabled", false);
+    this->declare_parameter<double>("pnp_time_limit_sec", 420.0);
+    this->declare_parameter<double>("pnp_retry_min_remaining_sec", 60.0);
+    this->declare_parameter<double>("pnp_safety_margin_sec", 25.0);
 
     this->get_parameter("map_frame", map_frame_);
     this->get_parameter("base_frame", base_frame_);
@@ -66,6 +71,16 @@ public:
     this->get_parameter(
       "ask_data_confirmation_enabled",
       ask_data_confirmation_enabled_);
+    this->get_parameter("pnp_time_limit_sec", pnp_time_limit_sec_);
+    this->get_parameter(
+      "pnp_retry_min_remaining_sec",
+      pnp_retry_min_remaining_sec_);
+    this->get_parameter("pnp_safety_margin_sec", pnp_safety_margin_sec_);
+
+    pnp_recovery_.configure(
+      pnp_time_limit_sec_,
+      pnp_retry_min_remaining_sec_,
+      pnp_safety_margin_sec_);
 
     if (ask_data_confirmation_override.has_value()) {
       ask_data_confirmation_enabled_ = *ask_data_confirmation_override;
@@ -79,6 +94,12 @@ public:
       this->get_logger(),
       "ask_data_confirmation_enabled=%s",
       ask_data_confirmation_enabled_ ? "true" : "false");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "pnp_time_limit_sec=%.1f retry_min_remaining_sec=%.1f safety_margin_sec=%.1f",
+      pnp_time_limit_sec_,
+      pnp_retry_min_remaining_sec_,
+      pnp_safety_margin_sec_);
 
     // --- Entradas ROS ---
     // /system/status indica si los modulos minimos estan disponibles.
@@ -1083,6 +1104,19 @@ private:
     instruction_cmd_pub_->publish(msg);
   }
 
+  void publishSkipCommand(int count)
+  {
+    if (count <= 0) {
+      return;
+    }
+
+    // supervisor_plan interpreta valores negativos como "saltar N pasos
+    // normales" antes de entregar la siguiente instruccion ejecutable.
+    std_msgs::msg::Int32 msg;
+    msg.data = -count;
+    instruction_cmd_pub_->publish(msg);
+  }
+
   void publishOverrideInstruction(const std::string & instruction)
   {
     // Inyecta una instruccion temporal en supervisor_plan. Esa instruccion se
@@ -1097,6 +1131,83 @@ private:
     // Publica el override y libera exactamente un ciclo plan->executor.
     publishOverrideInstruction(instruction);
     return publishAllowNextCycle();
+  }
+
+  bool executePnpCommand(const supervisor_manager::PnpRecoveryManager::Command & command)
+  {
+    using CommandType = supervisor_manager::PnpRecoveryManager::CommandType;
+
+    if (!command.handled()) {
+      return false;
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[PNP] command=%u instruction='%s' skip_count=%d reason='%s'",
+      static_cast<unsigned int>(command.type),
+      command.instruction.c_str(),
+      command.skip_count,
+      command.reason.c_str());
+
+    switch (command.type) {
+      case CommandType::ALLOW_NEXT:
+        publishAllowNextCycle();
+        return true;
+
+      case CommandType::DISPATCH_OVERRIDE:
+        if (command.instruction.empty()) {
+          RCLCPP_WARN(this->get_logger(), "[PNP] empty override command ignored");
+          return false;
+        }
+        dispatchOverrideInstruction(command.instruction);
+        return true;
+
+      case CommandType::SKIP_NEXT:
+        if (command.skip_count > 0) {
+          publishSkipCommand(command.skip_count);
+        }
+        publishAllowNextCycle();
+        return true;
+
+      case CommandType::FINISH:
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[PNP] final summary: %s",
+          pnp_recovery_.summaryReport(this->now()).c_str());
+        state_ = State::SM_FINISH;
+        return true;
+
+      case CommandType::NONE:
+      default:
+        return false;
+    }
+  }
+
+  bool handlePnpFeedback(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    supervisor_manager::PnpFeedback pnp_feedback;
+    pnp_feedback.action = feedback.action;
+    pnp_feedback.argument = feedback.argument;
+    pnp_feedback.worker_result = feedback.worker_result;
+    pnp_feedback.approved = feedback.approved;
+    pnp_feedback.status = feedback.status;
+
+    auto command = pnp_recovery_.handleFeedback(pnp_feedback, this->now());
+    if (command.handled() && isSuccessfulFeedback(feedback)) {
+      if (isTakeAction(feedback)) {
+        take_retry_pending_ = false;
+        take_retry_instruction_.clear();
+        take_approach_retry_state_ = TakeApproachRetryState::IDLE;
+        take_approach_retry_argument_.clear();
+        resetTakePnpRecovery();
+      }
+
+      if (isDropAction(feedback)) {
+        resetDropApproachRecovery();
+      }
+    }
+    return executePnpCommand(command);
   }
 
   bool isSuccessfulFeedback(
@@ -2722,8 +2833,17 @@ private:
 
     RCLCPP_WARN(
       this->get_logger(),
-      "[TakePnpRecovery] Recovery exhausted for '%s'; ignoring object and continuing",
+      "[TakePnpRecovery] Recovery exhausted for '%s'",
       take_pnp_recovery_argument_.c_str());
+
+    if (pnp_recovery_.isManagedObject(take_pnp_recovery_argument_)) {
+      const std::string exhausted_object = take_pnp_recovery_argument_;
+      resetTakePnpRecovery();
+      auto command = pnp_recovery_.handleTakeRecoveryExhausted(
+        exhausted_object,
+        this->now());
+      return executePnpCommand(command);
+    }
 
     take_ignored_objects_.insert(normalizeText(take_pnp_recovery_argument_));
 
@@ -3316,6 +3436,7 @@ private:
           this->get_logger(),
           "SM_WAIT_PLAN_READY: supervisor_plan confirmed plan is ready"
         );
+        pnp_recovery_.reset(this->now());
         state_ = State::SM_POST_PLAN_TRIGGER;
         break;
       }
@@ -3421,6 +3542,11 @@ private:
         }
 
         if (handlePersonApproachRecovery(feedback))
+        {
+          break;
+        }
+
+        if (handlePnpFeedback(feedback))
         {
           break;
         }
@@ -3732,6 +3858,10 @@ private:
 
               if(!natural_language_planning_)
               {
+                auto pnp_finish_command = pnp_recovery_.handlePlanFinished(this->now());
+                if (executePnpCommand(pnp_finish_command)) {
+                  break;
+                }
                 state_ = State::SM_FINISH;
                 break;
               }
@@ -3819,6 +3949,10 @@ private:
   std::string map_frame_{"map"};
   std::string base_frame_{"base_link"};
   double go_to_success_distance_tolerance_m_{0.75};
+  double pnp_time_limit_sec_{420.0};
+  double pnp_retry_min_remaining_sec_{60.0};
+  double pnp_safety_margin_sec_{25.0};
+  supervisor_manager::PnpRecoveryManager pnp_recovery_;
   static constexpr int MAX_NATURAL_LANGUAGE_LISTEN_RETRIES = 3;
   bool at_instruction_point_{false};
   bool known_locations_loaded_{false};

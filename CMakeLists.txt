@@ -29,12 +29,27 @@ find_package(yaml-cpp REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(test_pnp_recovery
+    test/test_pnp_recovery.cpp
+    src/pnp_recovery.cpp
+  )
+  target_include_directories(test_pnp_recovery PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  ament_target_dependencies(test_pnp_recovery
+    rclcpp
+  )
 endif()
 
-add_executable(supervisor_manager_node src/supervisor_manager_node.cpp)
+add_executable(supervisor_manager_node
+  src/supervisor_manager_node.cpp
+  src/pnp_recovery.cpp
+)
 
 target_include_directories(supervisor_manager_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
