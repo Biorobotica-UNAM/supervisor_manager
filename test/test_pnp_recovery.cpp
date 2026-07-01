@@ -35,6 +35,13 @@ PnpFeedback success(
   return feedback(action, argument, true, kSuccess, worker_result);
 }
 
+PnpFeedback recoveredTakeSuccess(const std::string & argument)
+{
+  PnpFeedback out = success("take", argument, "right_arm_group_take_completed");
+  out.take_recovery_context = true;
+  return out;
+}
+
 PnpFeedback failure(
   const std::string & action,
   const std::string & argument,
@@ -76,7 +83,7 @@ TEST(PnpRecoveryManager, RetriesPostponedTablewareBeforeDishwasherTrip)
     rclcpp::Time(2, 0, RCL_ROS_TIME));
 
   EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
-  EXPECT_EQ(command.instruction, "Justina align table");
+  EXPECT_EQ(command.instruction, "Justina go_to kitchen_table");
 }
 
 TEST(PnpRecoveryManager, SkipsDestinationTripWhenSingleObjectBatchFailsTwice)
@@ -91,17 +98,75 @@ TEST(PnpRecoveryManager, SkipsDestinationTripWhenSingleObjectBatchFailsTwice)
       "take_failed_object_still_present:cutlery_1"),
     rclcpp::Time(1, 0, RCL_ROS_TIME));
   EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
+  EXPECT_EQ(command.instruction, "Justina go_to kitchen_table");
+
+  command = manager.handleFeedback(
+    success("go_to", "kitchen_table", "arrived_at:kitchen_table"),
+    rclcpp::Time(2, 0, RCL_ROS_TIME));
+  EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
   EXPECT_EQ(command.instruction, "Justina align table");
+
+  command = manager.handleFeedback(
+    success("align", "table", "align_completed:table"),
+    rclcpp::Time(3, 0, RCL_ROS_TIME));
+  EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
+  EXPECT_EQ(command.instruction, "Justina find_object cutlery_1");
+
+  command = manager.handleFeedback(
+    success("find_object", "cutlery_1", "object_found:cutlery_1"),
+    rclcpp::Time(4, 0, RCL_ROS_TIME));
+  EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
+  EXPECT_EQ(command.instruction, "Justina take cutlery_1");
+
+  command = manager.handleFeedback(
+    success("take", "cutlery_1", "right_arm_group_take_completed"),
+    rclcpp::Time(5, 0, RCL_ROS_TIME));
+  EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
+  EXPECT_EQ(command.instruction, "Justina verify_take cutlery_1");
 
   command = manager.handleFeedback(
     failure(
       "verify_take",
       "cutlery_1",
       "take_failed_object_still_present:cutlery_1"),
-    rclcpp::Time(2, 0, RCL_ROS_TIME));
+    rclcpp::Time(6, 0, RCL_ROS_TIME));
+  EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
+  EXPECT_EQ(command.instruction, "Justina go_to kitchen_table");
 
+  command = manager.handleFeedback(
+    success("go_to", "kitchen_table", "arrived_at:kitchen_table"),
+    rclcpp::Time(7, 0, RCL_ROS_TIME));
   EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::SKIP_NEXT);
   EXPECT_EQ(command.skip_count, 6);
+}
+
+TEST(PnpRecoveryManager, RecoveredTakeVerifyFailureReturnsToSourceAndFinalFails)
+{
+  PnpRecoveryManager manager;
+  manager.reset(rclcpp::Time(0, 0, RCL_ROS_TIME));
+
+  auto command = manager.handleFeedback(
+    recoveredTakeSuccess("tableware_1"),
+    rclcpp::Time(1, 0, RCL_ROS_TIME));
+  EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
+  EXPECT_EQ(command.instruction, "Justina verify_take tableware_1");
+
+  command = manager.handleFeedback(
+    failure(
+      "verify_take",
+      "tableware_1",
+      "take_failed_object_still_present:tableware_1"),
+    rclcpp::Time(2, 0, RCL_ROS_TIME));
+  EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::DISPATCH_OVERRIDE);
+  EXPECT_EQ(command.instruction, "Justina go_to kitchen_table");
+
+  command = manager.handleFeedback(
+    success("go_to", "kitchen_table", "arrived_at:kitchen_table"),
+    rclcpp::Time(3, 0, RCL_ROS_TIME));
+  EXPECT_EQ(command.type, PnpRecoveryManager::CommandType::ALLOW_NEXT);
+
+  const std::string report = manager.summaryReport(rclcpp::Time(4, 0, RCL_ROS_TIME));
+  EXPECT_NE(report.find("skipped=[tableware_1]"), std::string::npos);
 }
 
 TEST(PnpRecoveryManager, StartsSecondPassWhenBacklogAndTimeRemain)
@@ -116,12 +181,6 @@ TEST(PnpRecoveryManager, StartsSecondPassWhenBacklogAndTimeRemain)
       "trash_1",
       "take_failed_object_still_present:trash_1"),
     rclcpp::Time(1, 0, RCL_ROS_TIME));
-  (void)manager.handleFeedback(
-    failure(
-      "verify_take",
-      "trash_1",
-      "take_failed_object_still_present:trash_1"),
-    rclcpp::Time(2, 0, RCL_ROS_TIME));
 
   const auto command = manager.handlePlanFinished(rclcpp::Time(100, 0, RCL_ROS_TIME));
 
@@ -141,12 +200,6 @@ TEST(PnpRecoveryManager, FinishesSecondPassWhenTimeIsLow)
       "trash_1",
       "take_failed_object_still_present:trash_1"),
     rclcpp::Time(1, 0, RCL_ROS_TIME));
-  (void)manager.handleFeedback(
-    failure(
-      "verify_take",
-      "trash_1",
-      "take_failed_object_still_present:trash_1"),
-    rclcpp::Time(2, 0, RCL_ROS_TIME));
 
   const auto command = manager.handlePlanFinished(rclcpp::Time(380, 0, RCL_ROS_TIME));
 

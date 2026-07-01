@@ -1191,6 +1191,11 @@ private:
     pnp_feedback.argument = feedback.argument;
     pnp_feedback.worker_result = feedback.worker_result;
     pnp_feedback.approved = feedback.approved;
+    pnp_feedback.take_recovery_context =
+      isTakeAction(feedback) &&
+      isSuccessfulFeedback(feedback) &&
+      take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_TAKE_RETRY &&
+      normalizeText(take_pnp_recovery_argument_) == normalizeText(feedback.argument);
     pnp_feedback.status = feedback.status;
 
     auto command = pnp_recovery_.handleFeedback(pnp_feedback, this->now());
@@ -2964,9 +2969,8 @@ private:
       if (isSuccessfulFeedback(feedback)) {
         RCLCPP_INFO(
           this->get_logger(),
-          "[TakePnpRecovery] Take '%s' succeeded during recovery; resuming plan",
+          "[TakePnpRecovery] Take '%s' succeeded during recovery; waiting for verify_take",
           take_pnp_recovery_argument_.c_str());
-        resetTakePnpRecovery();
         return false;  // Let the normal success path advance the plan.
       }
 

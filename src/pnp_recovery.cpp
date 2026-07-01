@@ -25,6 +25,7 @@ void PnpRecoveryManager::reset(const rclcpp::Time & now)
   initializePlans();
   states_.clear();
   second_pass_done_.clear();
+  pending_recovery_verifications_.clear();
   queued_instructions_.clear();
   sequence_mode_ = SequenceMode::NONE;
   active_object_.clear();
@@ -54,9 +55,18 @@ PnpRecoveryManager::Command PnpRecoveryManager::handleFeedback(
   }
 
   if (isTakeAction(feedback) && isManagedObject(feedback.argument) && isSuccessful(feedback)) {
+    if (feedback.take_recovery_context) {
+      pending_recovery_verifications_.insert(feedback.argument);
+    }
     return dispatch(
       makeInstruction("verify_take", feedback.argument),
       "verify successful take before advancing PNP flow");
+  }
+
+  if (isReturnToSourceMode() && isSuccessful(feedback) &&
+    normalize(feedback.action) == "go_to")
+  {
+    return completeReturnToSourceAfterFinalFailure(now);
   }
 
   if (sequence_mode_ != SequenceMode::NONE && !queued_instructions_.empty() &&
@@ -373,12 +383,15 @@ PnpRecoveryManager::Command PnpRecoveryManager::startInBatchRetry(const std::str
   active_batch_ = plan->batch;
   sequence_mode_ = SequenceMode::IN_BATCH_RETRY;
   queued_instructions_.clear();
+  // A retry may begin after an approach left the base close to the object.
+  // Return to the nominal source pose first so align/find/take use the same
+  // geometry as the original CLIPS phase.
+  queued_instructions_.push_back(makeInstruction("go_to", plan->source_go_to));
+  if (!plan->source_align.empty()) {
+    queued_instructions_.push_back(makeInstruction("align", plan->source_align));
+  }
   queued_instructions_.push_back(makeInstruction("find_object", plan->object));
   queued_instructions_.push_back(makeInstruction("take", plan->object));
-
-  if (!plan->source_align.empty()) {
-    queued_instructions_.push_front(makeInstruction("align", plan->source_align));
-  }
 
   return dispatchNextQueued("retrying postponed PNP object before transfer");
 }
@@ -428,6 +441,57 @@ PnpRecoveryManager::Command PnpRecoveryManager::startSecondPassDelivery(
   return dispatchNextQueued("delivering recovered second-pass object");
 }
 
+PnpRecoveryManager::Command PnpRecoveryManager::startReturnToSourceAfterFinalFailure(
+  const std::string & object)
+{
+  const ObjectPlan * plan = objectPlan(object);
+  if (!plan) {
+    return Command{};
+  }
+
+  if (sequence_mode_ == SequenceMode::SECOND_PASS_FETCH) {
+    sequence_mode_ = SequenceMode::RETURN_TO_SOURCE_AFTER_SECOND_PASS_FAILURE;
+  } else if (sequence_mode_ == SequenceMode::IN_BATCH_RETRY) {
+    sequence_mode_ = SequenceMode::RETURN_TO_SOURCE_AFTER_IN_BATCH_FAILURE;
+  } else {
+    sequence_mode_ = SequenceMode::RETURN_TO_SOURCE_AFTER_NOMINAL_FAILURE;
+  }
+
+  active_object_ = plan->object;
+  active_batch_ = plan->batch;
+  queued_instructions_.clear();
+  // When verify_take disproves a recovered take, we may be at the close
+  // approach pose. Move back to source before skipping or trying another item.
+  return dispatch(
+    makeInstruction("go_to", plan->source_go_to),
+    "returning to source after final verified-take failure");
+}
+
+PnpRecoveryManager::Command PnpRecoveryManager::completeReturnToSourceAfterFinalFailure(
+  const rclcpp::Time & now)
+{
+  const std::string object = active_object_;
+  const bool was_in_batch_retry =
+    sequence_mode_ == SequenceMode::RETURN_TO_SOURCE_AFTER_IN_BATCH_FAILURE;
+  const bool was_second_pass =
+    sequence_mode_ == SequenceMode::RETURN_TO_SOURCE_AFTER_SECOND_PASS_FAILURE;
+
+  sequence_mode_ = SequenceMode::NONE;
+  active_object_.clear();
+  active_batch_.clear();
+
+  if (object.empty()) {
+    return Command{};
+  }
+
+  if (was_second_pass) {
+    second_pass_done_.insert(object);
+    return maybeStartNextSecondPass(now);
+  }
+
+  return afterBatchObjectDone(object, now, was_in_batch_retry);
+}
+
 PnpRecoveryManager::Command PnpRecoveryManager::completeActiveObjectAttempt(
   const std::string & object,
   bool verified,
@@ -440,6 +504,8 @@ PnpRecoveryManager::Command PnpRecoveryManager::completeActiveObjectAttempt(
 
   ObjectState & state = stateFor(plan->object);
   state.postponed = false;
+  const bool was_take_recovery =
+    pending_recovery_verifications_.erase(plan->object) > 0;
 
   if (verified) {
     state.carried = true;
@@ -456,10 +522,21 @@ PnpRecoveryManager::Command PnpRecoveryManager::completeActiveObjectAttempt(
 
   state.carried = false;
   ++state.failed_attempts;
-  if (state.failed_attempts < 2) {
+  // A first nominal verify failure only postpones the object. If the failure
+  // happened during a supervisor recovery sequence, or this is already the
+  // second failed attempt, close the object and return to its source pose.
+  const bool recovery_sequence =
+    sequence_mode_ == SequenceMode::IN_BATCH_RETRY ||
+    sequence_mode_ == SequenceMode::SECOND_PASS_FETCH;
+  const bool final_failure =
+    recovery_sequence || was_take_recovery || state.failed_attempts >= 2;
+
+  if (!final_failure) {
     state.postponed = true;
   } else {
     state.final_failed = true;
+    state.postponed = false;
+    return startReturnToSourceAfterFinalFailure(plan->object);
   }
 
   if (sequence_mode_ == SequenceMode::SECOND_PASS_FETCH) {
@@ -477,14 +554,15 @@ PnpRecoveryManager::Command PnpRecoveryManager::completeActiveObjectAttempt(
 
 PnpRecoveryManager::Command PnpRecoveryManager::afterBatchObjectDone(
   const std::string & object,
-  const rclcpp::Time & now)
+  const rclcpp::Time & now,
+  bool force_batch_complete)
 {
   const ObjectPlan * plan = objectPlan(object);
   if (!plan) {
     return Command{};
   }
 
-  if (!batchCollectionComplete(plan->batch, plan->object)) {
+  if (!force_batch_complete && !batchCollectionComplete(plan->batch, plan->object)) {
     return allow("continuing nominal PNP object list");
   }
 
@@ -574,6 +652,13 @@ PnpRecoveryManager::Command PnpRecoveryManager::maybeStartNextSecondPass(
 bool PnpRecoveryManager::hasPendingRetryInBatch(const std::string & batch) const
 {
   return nextPendingRetryInBatch(batch).has_value();
+}
+
+bool PnpRecoveryManager::isReturnToSourceMode() const
+{
+  return sequence_mode_ == SequenceMode::RETURN_TO_SOURCE_AFTER_NOMINAL_FAILURE ||
+         sequence_mode_ == SequenceMode::RETURN_TO_SOURCE_AFTER_IN_BATCH_FAILURE ||
+         sequence_mode_ == SequenceMode::RETURN_TO_SOURCE_AFTER_SECOND_PASS_FAILURE;
 }
 
 std::optional<std::string> PnpRecoveryManager::nextPendingRetryInBatch(

@@ -19,9 +19,23 @@ struct PnpFeedback
   std::string argument;
   std::string worker_result;
   bool approved{false};
+  bool take_recovery_context{false};
   uint8_t status{0};
 };
 
+// Runtime policy for the fixed PNP plan emitted by pnp_planning_Justina.clp.
+//
+// The CLIPS plan remains a linear nominal recipe. This class observes executor
+// feedback and returns small commands for supervisor_manager:
+// - insert verify_take after every successful managed take,
+// - postpone a first failed object while the nominal plan continues,
+// - run source-local retries before the destination transfer,
+// - skip destination/drop steps for objects that were never verified as carried,
+// - spend remaining time on a second pass over failed objects.
+//
+// It does not publish by itself. supervisor_manager executes each returned
+// Command by injecting an override instruction, allowing the next normal step,
+// skipping normal plan steps, or finishing the PNP task.
 class PnpRecoveryManager
 {
 public:
@@ -98,7 +112,10 @@ private:
     NONE,
     IN_BATCH_RETRY,
     SECOND_PASS_FETCH,
-    SECOND_PASS_DELIVER
+    SECOND_PASS_DELIVER,
+    RETURN_TO_SOURCE_AFTER_NOMINAL_FAILURE,
+    RETURN_TO_SOURCE_AFTER_IN_BATCH_FAILURE,
+    RETURN_TO_SOURCE_AFTER_SECOND_PASS_FAILURE
   };
 
   static std::string normalize(std::string value);
@@ -127,17 +144,23 @@ private:
   Command startInBatchRetry(const std::string & object);
   Command startSecondPassFetch(const std::string & object);
   Command startSecondPassDelivery(const std::string & object);
+  Command startReturnToSourceAfterFinalFailure(const std::string & object);
+  Command completeReturnToSourceAfterFinalFailure(const rclcpp::Time & now);
   Command completeActiveObjectAttempt(
     const std::string & object,
     bool verified,
     const rclcpp::Time & now);
 
-  Command afterBatchObjectDone(const std::string & object, const rclcpp::Time & now);
+  Command afterBatchObjectDone(
+    const std::string & object,
+    const rclcpp::Time & now,
+    bool force_batch_complete = false);
   Command finalizeBatchBeforeTransfer(const std::string & batch, const rclcpp::Time & now);
   Command maybeSkipUncarriedDrops(const std::string & batch);
   Command maybeStartNextSecondPass(const rclcpp::Time & now);
 
   bool hasPendingRetryInBatch(const std::string & batch) const;
+  bool isReturnToSourceMode() const;
   std::optional<std::string> nextPendingRetryInBatch(const std::string & batch) const;
   std::optional<std::string> nextSecondPassObject() const;
   bool batchHasCarried(const std::string & batch) const;
@@ -149,6 +172,7 @@ private:
   std::unordered_map<std::string, ObjectState> states_;
   std::vector<std::string> second_pass_order_;
   std::unordered_set<std::string> second_pass_done_;
+  std::unordered_set<std::string> pending_recovery_verifications_;
 
   std::deque<std::string> queued_instructions_;
   SequenceMode sequence_mode_{SequenceMode::NONE};
