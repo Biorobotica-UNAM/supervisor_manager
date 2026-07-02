@@ -215,7 +215,9 @@ private:
     // Sub-FSM local para follow dinamico disparado por say instruct_follow_*,
     // sin consumir pasos fijos del plan CLIPS.
     IDLE,
+    WAIT_START_LISTEN,
     WAIT_FOLLOW_ENABLE,
+    WAIT_STOP_LISTEN,
     WAIT_FOLLOW_DISABLE,
     WAIT_DROP_GIFT
   };
@@ -1250,7 +1252,9 @@ private:
   bool answerHasStop(const std::string & text) const
   {
     const std::string answer = normalizeConfirmationCommand(text);
-    return answer == "stop" || answer.rfind("stop ", 0U) == 0U;
+    return answer == "stop" ||
+           answer.rfind("stop ", 0U) == 0U ||
+           answer.find(" stop") != std::string::npos;
   }
 
   bool answerHasFollowOrContinue(const std::string & text) const
@@ -1418,6 +1422,8 @@ private:
     follow_gift_state_ = FollowGiftState::IDLE;
     follow_drop_after_stop_ = false;
     follow_destination_.clear();
+    follow_start_listen_attempts_ = 0;
+    follow_stop_listen_attempts_ = 0;
   }
 
   bool dispatchFollowGiftInstruction(
@@ -1431,6 +1437,21 @@ private:
       instruction.c_str(),
       static_cast<unsigned int>(follow_gift_state_));
     return dispatchOverrideInstruction(instruction);
+  }
+
+  std::string followListenAnswer(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string stored_value = extractStoredListenValue(feedback.worker_result);
+    if (!stored_value.empty()) {
+      return stored_value;
+    }
+    return feedback.worker_result;
+  }
+
+  bool dispatchFollowListen(FollowGiftState next_state)
+  {
+    return dispatchFollowGiftInstruction("Justina listen follow", next_state);
   }
 
   bool handleFollowGiftSequence(
@@ -1450,42 +1471,9 @@ private:
     {
       follow_drop_after_stop_ = is_follow_gift_trigger;
       follow_destination_ = triggered_follow_destination;
-      const std::string answer = waitForFollowGiftAnswer(true);
-      if (answer == "stop") {
-        if (!follow_drop_after_stop_) {
-          sayText("Understood. I will not start following.");
-          resetFollowGiftSequence();
-          return false;
-        }
-        sayText("Understood. I am ready to leave the gift.");
-        return dispatchFollowGiftInstruction(
-          "Justina drop floor",
-          FollowGiftState::WAIT_DROP_GIFT);
-      }
-
-      if (answer.empty()) {
-        if (follow_destination_.empty()) {
-          sayText("I could not understand the instruction. I will start following you.");
-        } else {
-          sayText(
-            "I could not understand the instruction. I will start following you to " +
-            makeSpeechFriendly(follow_destination_) + ".");
-        }
-      }
-
-      if (answer == "follow") {
-        if (follow_destination_.empty()) {
-          sayText("Understood. I will start following you now.");
-        } else {
-          sayText(
-            "Understood. I will follow you to " +
-            makeSpeechFriendly(follow_destination_) + ".");
-        }
-      }
-
-      return dispatchFollowGiftInstruction(
-        "Justina follow enable",
-        FollowGiftState::WAIT_FOLLOW_ENABLE);
+      follow_start_listen_attempts_ = 0;
+      follow_stop_listen_attempts_ = 0;
+      return dispatchFollowListen(FollowGiftState::WAIT_START_LISTEN);
     }
 
     if (follow_gift_state_ == FollowGiftState::IDLE) {
@@ -1494,10 +1482,64 @@ private:
 
     switch (follow_gift_state_)
     {
+      case FollowGiftState::WAIT_START_LISTEN:
+      {
+        if (!feedbackMatches(feedback, "listen", "follow")) {
+          return false;
+        }
+
+        ++follow_start_listen_attempts_;
+        const std::string answer = followListenAnswer(feedback);
+        const bool heard_stop = isSuccessfulFeedback(feedback) && answerHasStop(answer);
+        const bool heard_follow =
+          isSuccessfulFeedback(feedback) && answerHasFollowOrContinue(answer);
+
+        if (heard_stop) {
+          if (!follow_drop_after_stop_) {
+            sayText("Understood. I will not start following.");
+            resetFollowGiftSequence();
+            return false;
+          }
+          sayText("Understood. I am ready to leave the gift.");
+          return dispatchFollowGiftInstruction(
+            "Justina drop floor",
+            FollowGiftState::WAIT_DROP_GIFT);
+        }
+
+        if (!heard_follow) {
+          if (follow_start_listen_attempts_ < MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS) {
+            sayText("I could not understand. Please say follow, continue, or stop.");
+            return dispatchFollowListen(FollowGiftState::WAIT_START_LISTEN);
+          }
+
+          if (follow_destination_.empty()) {
+            sayText("I could not understand the instruction. I will start following you.");
+          } else {
+            sayText(
+              "I could not understand the instruction. I will start following you to " +
+              makeSpeechFriendly(follow_destination_) + ".");
+          }
+        }
+
+        if (heard_follow) {
+          if (follow_destination_.empty()) {
+            sayText("Understood. I will start following you now.");
+          } else {
+            sayText(
+              "Understood. I will follow you to " +
+              makeSpeechFriendly(follow_destination_) + ".");
+          }
+        }
+
+        return dispatchFollowGiftInstruction(
+          "Justina follow enable",
+          FollowGiftState::WAIT_FOLLOW_ENABLE);
+      }
+
       case FollowGiftState::WAIT_FOLLOW_ENABLE:
       {
-        // Cuando el seguimiento ya quedo activo, el manager escucha directo
-        // hasta oir stop, sin inyectar listen al plan.
+        // Cuando el seguimiento ya quedo activo, el manager encadena listen
+        // follow para usar knowledge_bank/dictionaries/follow.yaml.
         if (!feedbackMatches(feedback, "follow", "enable")) {
           return false;
         }
@@ -1519,12 +1561,44 @@ private:
               ". I will stop following you.");
           }
         } else {
-          waitForFollowGiftStop();
+          follow_stop_listen_attempts_ = 0;
+          return dispatchFollowListen(FollowGiftState::WAIT_STOP_LISTEN);
         }
 
         if (follow_drop_after_stop_) {
           sayText("Understood. I am ready to leave the gift.");
         } else if (follow_destination_.empty()) {
+          sayText("Understood. I will stop following you.");
+        }
+
+        return dispatchFollowGiftInstruction(
+          "Justina follow disable",
+          FollowGiftState::WAIT_FOLLOW_DISABLE);
+      }
+
+      case FollowGiftState::WAIT_STOP_LISTEN:
+      {
+        if (!feedbackMatches(feedback, "listen", "follow")) {
+          return false;
+        }
+
+        ++follow_stop_listen_attempts_;
+        const std::string answer = followListenAnswer(feedback);
+        if (!isSuccessfulFeedback(feedback) || !answerHasStop(answer)) {
+          if (follow_stop_listen_attempts_ % FOLLOW_GIFT_STOP_REPROMPT_EVERY_ATTEMPTS == 0) {
+            sayText("Say stop when you want me to stop.");
+          }
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[FollowGift] still waiting for stop; worker_result='%s' (attempt %d)",
+            feedback.worker_result.c_str(),
+            follow_stop_listen_attempts_);
+          return dispatchFollowListen(FollowGiftState::WAIT_STOP_LISTEN);
+        }
+
+        if (follow_drop_after_stop_) {
+          sayText("Understood. I am ready to leave the gift.");
+        } else {
           sayText("Understood. I will stop following you.");
         }
 
@@ -4050,6 +4124,8 @@ private:
   FollowGiftState follow_gift_state_{FollowGiftState::IDLE};
   bool follow_drop_after_stop_{false};
   std::string follow_destination_;
+  int follow_start_listen_attempts_{0};
+  int follow_stop_listen_attempts_{0};
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
