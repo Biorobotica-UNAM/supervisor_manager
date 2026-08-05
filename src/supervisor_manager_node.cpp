@@ -397,6 +397,36 @@ private:
     return sayText("I did not understand your command. Please repeat the instruction.");
   }
 
+  bool askUserToRepeatSimplerCommand(int attempt)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user to repeat the command more simply, retry %d/%d...",
+      attempt,
+      MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
+    return sayText(
+      "Please repeat the same command, but use a simpler sentence.");
+  }
+
+  bool askCustomerForFinalCommandAttempt()
+  {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking customer for help before final command attempt...");
+    return sayText(
+      "I could not understand the command. I need the customer, please. "
+      "This is my last attempt. Please repeat the command clearly.");
+  }
+
+  bool askUserForDifferentNaturalLanguageCommand()
+  {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user for a different command after exhausted attempts...");
+    return sayText(
+      "I still could not understand that command. Please give me a different command.");
+  }
+
   bool askUserToRepeatInvalidDestinationCommand(
     const std::string & destination,
     int attempt)
@@ -434,6 +464,85 @@ private:
       "I still could not understand your command. "
       "I will restart the sequence from the beginning and navigate to the instruction point again.");
     at_instruction_point_ = false;
+  }
+
+  bool waitForCommandContinue()
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Waiting for 'continue' before asking for the command...");
+
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(LISTEN_CONTINUE_TIMEOUT_SEC);
+    int attempt = 0;
+
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      ++attempt;
+
+      if (attempt == 1 || attempt % LISTEN_CONTINUE_REPROMPT_EVERY_RETRIES == 0) {
+        if (!sayText("Please say, continue, to proceed.")) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[Pipeline][Step 0] could not announce wait_for_command_continue through TTS");
+        }
+      }
+
+      if (!listener_client_) {
+        RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 0] Listen client not initialized");
+        return false;
+      }
+
+      if (!listener_client_->wait_for_service(1s)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[Pipeline][Step 0] Listen service unavailable while waiting for continue");
+        rclcpp::sleep_for(500ms);
+        continue;
+      }
+
+      auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
+      request->enable = true;
+      request->grammar = "";
+
+      auto future = listener_client_->async_send_request(request);
+      const auto status = future.wait_for(10s);
+      if (status != std::future_status::ready) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[Pipeline][Step 0] Listen timeout while waiting for continue");
+        continue;
+      }
+
+      const auto response = future.get();
+      if (!response->success) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[Pipeline][Step 0] Listen failed while waiting for continue");
+        continue;
+      }
+
+      const std::string text = response->recognized_speech;
+      if (listenContinueHeard(text)) {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[Pipeline][Step 0] Heard continue: \"%s\"",
+          text.c_str());
+        return true;
+      }
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Step 0] Ignoring response while waiting for continue: \"%s\"",
+        text.c_str());
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 0] Timed out after %d seconds without hearing continue",
+      LISTEN_CONTINUE_TIMEOUT_SEC);
+    sayText("I did not hear continue after three minutes. I will restart the instruction sequence.");
+    at_instruction_point_ = false;
+    return false;
   }
 
   std::string stepListen()
@@ -475,6 +584,36 @@ private:
 
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 1] Recognised: \"%s\"", text.c_str());
     return text;
+  }
+
+  bool confirmHeardCommand(const std::string & text)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 1] Confirming heard command with user: \"%s\"",
+      text.c_str());
+
+    if (!sayText("I heard: " + text + ". Is that correct?")) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Step 1] Could not ask command confirmation through TTS");
+      return false;
+    }
+
+    const std::string answer = listenYesNo();
+    if (isYesAnswer(answer)) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Pipeline][Step 1] User confirmed command with answer: \"%s\"",
+        answer.c_str());
+      return true;
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 1] User did not confirm command. answer=\"%s\"",
+      answer.c_str());
+    return false;
   }
 
   std::string stepParse(const std::string & text)
@@ -825,6 +964,11 @@ private:
         RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step -1: goToInstructionPoint failed");
         return false;
       }
+
+      if (!waitForCommandContinue()) {
+        RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: waitForCommandContinue failed");
+        return false;
+      }
     } else {
       RCLCPP_INFO(
         this->get_logger(),
@@ -837,90 +981,134 @@ private:
     }
 
     std::string semantic;
-    int invalid_destination_attempts = 0;
-    for (int retry = 0; retry <= MAX_NATURAL_LANGUAGE_LISTEN_RETRIES; ++retry) {
-      enum class RetryPrompt : uint8_t {RepeatCommand, RepeatInvalidDestination, DifferentCommand};
-      RetryPrompt retry_prompt = RetryPrompt::RepeatCommand;
-      std::string invalid_destination;
+    bool prompt_for_command = false;
 
-      const std::string text = stepListen();
-      if (text.empty()) {
-        RCLCPP_WARN(
-          this->get_logger(),
-          "Pipeline listen attempt %d/%d failed",
-          retry + 1,
-          MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
-      } else {
-        semantic = stepParse(text);
-        if (semantic.empty()) {
+    while (rclcpp::ok() && semantic.empty()) {
+      if (prompt_for_command && !promptForCommand()) {
+        RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: promptForCommand failed");
+        return false;
+      }
+      prompt_for_command = true;
+
+      int invalid_destination_attempts = 0;
+      for (int retry = 0; retry <= MAX_NATURAL_LANGUAGE_LISTEN_RETRIES; ++retry) {
+        enum class RetryPrompt : uint8_t {
+          RepeatCommand,
+          RepeatSimplerCommand,
+          RepeatInvalidDestination,
+          DifferentCommand
+        };
+        RetryPrompt retry_prompt = RetryPrompt::RepeatCommand;
+        std::string invalid_destination;
+
+        const std::string text = stepListen();
+        if (text.empty()) {
           RCLCPP_WARN(
             this->get_logger(),
-            "Pipeline semantic parse attempt %d/%d failed",
+            "Pipeline listen attempt %d/%d failed",
             retry + 1,
             MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
         } else {
-          const SemanticValidationResult validation = validateSemanticDestinations(semantic);
-          if (!validation.valid) {
-            if (validation.command_aborted) {
-              RCLCPP_WARN(
-                this->get_logger(),
-                "[Pipeline][Step 2] Semantic parser aborted command: %s",
-                validation.abort_reason.empty()
-                  ? "unknown validation error"
-                  : validation.abort_reason.c_str());
-            }
+          if (!confirmHeardCommand(text)) {
+            retry_prompt = RetryPrompt::RepeatSimplerCommand;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "Pipeline command confirmation attempt %d/%d failed",
+              retry + 1,
+              MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+          } else {
+            semantic = stepParse(text);
+          }
 
-            if (validation.unknown_destination) {
-              RCLCPP_WARN(
-                this->get_logger(),
-                "[Pipeline][Step 2] Semantic destination is unknown; asking for instruction again");
-            }
+          if (!semantic.empty()) {
+            const SemanticValidationResult validation = validateSemanticDestinations(semantic);
+            if (!validation.valid) {
+              if (validation.command_aborted) {
+                RCLCPP_WARN(
+                  this->get_logger(),
+                  "[Pipeline][Step 2] Semantic parser aborted command: %s",
+                  validation.abort_reason.empty()
+                    ? "unknown validation error"
+                    : validation.abort_reason.c_str());
+              }
 
-            if (!validation.invalid_destinations.empty()) {
-              ++invalid_destination_attempts;
-              invalid_destination = firstInvalidDestination(validation);
-              retry_prompt = invalid_destination_attempts >= 2
-                ? RetryPrompt::DifferentCommand
-                : RetryPrompt::RepeatInvalidDestination;
-              RCLCPP_WARN(
-                this->get_logger(),
-                "[Pipeline][Step 2] Semantic destination '%s' is not in knowledge_bank/domains/locations.yaml; attempt %d",
-                invalid_destination.c_str(),
-                invalid_destination_attempts);
-            }
+              if (validation.unknown_destination) {
+                RCLCPP_WARN(
+                  this->get_logger(),
+                  "[Pipeline][Step 2] Semantic destination is unknown; asking for instruction again");
+              }
 
-            semantic.clear();
+              if (!validation.invalid_destinations.empty()) {
+                ++invalid_destination_attempts;
+                invalid_destination = firstInvalidDestination(validation);
+                retry_prompt = invalid_destination_attempts >= 2
+                  ? RetryPrompt::DifferentCommand
+                  : RetryPrompt::RepeatInvalidDestination;
+                RCLCPP_WARN(
+                  this->get_logger(),
+                  "[Pipeline][Step 2] Semantic destination '%s' is not in knowledge_bank/domains/locations.yaml; attempt %d",
+                  invalid_destination.c_str(),
+                  invalid_destination_attempts);
+              }
+
+              semantic.clear();
+            }
+          } else if (retry_prompt == RetryPrompt::RepeatCommand) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "Pipeline semantic parse attempt %d/%d failed",
+              retry + 1,
+              MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+          }
+        }
+
+        if (!semantic.empty()) {
+          break;
+        }
+
+        if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES) {
+          bool prompt_ok = false;
+          if (retry + 1 == MAX_NATURAL_LANGUAGE_LISTEN_RETRIES) {
+            prompt_ok = askCustomerForFinalCommandAttempt();
+          } else {
+            switch (retry_prompt) {
+              case RetryPrompt::RepeatSimplerCommand:
+                prompt_ok = askUserToRepeatSimplerCommand(retry + 1);
+                break;
+              case RetryPrompt::RepeatInvalidDestination:
+                prompt_ok = askUserToRepeatInvalidDestinationCommand(
+                  invalid_destination,
+                  retry + 1);
+                break;
+              case RetryPrompt::DifferentCommand:
+                prompt_ok = askUserForDifferentCommand(
+                  invalid_destination,
+                  retry + 1);
+                break;
+              case RetryPrompt::RepeatCommand:
+              default:
+                prompt_ok = askUserToRepeatCommand(retry + 1);
+                break;
+            }
+          }
+
+          if (!prompt_ok) {
+            RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: retry prompt failed");
+            return false;
           }
         }
       }
 
-      if (!semantic.empty()) {
-        break;
-      }
-
-      if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES) {
-        bool prompt_ok = false;
-        switch (retry_prompt) {
-          case RetryPrompt::RepeatInvalidDestination:
-            prompt_ok = askUserToRepeatInvalidDestinationCommand(
-              invalid_destination,
-              retry + 1);
-            break;
-          case RetryPrompt::DifferentCommand:
-            prompt_ok = askUserForDifferentCommand(
-              invalid_destination,
-              retry + 1);
-            break;
-          case RetryPrompt::RepeatCommand:
-          default:
-            prompt_ok = askUserToRepeatCommand(retry + 1);
-            break;
-        }
-
-        if (!prompt_ok) {
-          RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: retry prompt failed");
+      if (semantic.empty()) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "Pipeline exhausted %d command attempts; requesting a different command",
+          MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+        if (!askUserForDifferentNaturalLanguageCommand()) {
+          RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: different-command prompt failed");
           return false;
         }
+        prompt_for_command = false;
       }
     }
 
@@ -1249,21 +1437,38 @@ private:
     return argument.substr(kPrefix.size());
   }
 
+  bool commandHasToken(const std::string & text, const std::string & expected_token) const
+  {
+    const std::string command = normalizeConfirmationCommand(text);
+    std::size_t start = 0;
+
+    while (start < command.size()) {
+      const std::size_t end = command.find(' ', start);
+      const std::size_t token_end = end == std::string::npos ? command.size() : end;
+      if (command.compare(start, token_end - start, expected_token) == 0) {
+        return true;
+      }
+
+      if (end == std::string::npos) {
+        break;
+      }
+      start = end + 1;
+    }
+
+    return false;
+  }
+
   bool answerHasStop(const std::string & text) const
   {
-    const std::string answer = normalizeConfirmationCommand(text);
-    return answer == "stop" ||
-           answer.rfind("stop ", 0U) == 0U ||
-           answer.find(" stop") != std::string::npos;
+    return commandHasToken(text, "stop");
   }
 
   bool answerHasFollowOrContinue(const std::string & text) const
   {
     // La primera respuesta acepta follow o continue como permiso para activar
     // seguimiento humano.
-    const std::string answer = normalizeText(text);
-    return answer.find("follow") != std::string::npos ||
-           answer.find("continue") != std::string::npos;
+    return commandHasToken(text, "follow") ||
+           commandHasToken(text, "continue");
   }
 
   std::string listenFollowGiftAnswer()
@@ -1690,16 +1895,7 @@ private:
 
   bool listenContinueHeard(const std::string & worker_result) const
   {
-    std::string normalized = normalizeConfirmationCommand(worker_result);
-    const std::string prefix = "continue ";
-    if (normalized.rfind(prefix, 0U) == 0U) {
-      normalized = normalized.substr(prefix.size());
-    }
-
-    return normalized == "continue" ||
-           normalized == "robot continue" ||
-           normalized == "please continue" ||
-           normalized.find(" continue") != std::string::npos;
+    return commandHasToken(worker_result, "continue");
   }
 
   bool handleListenContinueGate(
@@ -1851,10 +2047,41 @@ private:
     return "Your " + makeSpeechFriendly(attribute) + " is " + value + ". Is that correct?";
   }
 
+  std::string extractConfirmationAnswer(const std::string & speech)
+  {
+    if (speech.empty()) {
+      return "";
+    }
+
+    if (!planning_) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[Confirmation] Planning tool not initialized; cannot use confirm dictionary");
+      return "";
+    }
+
+    const auto confirmations = planning_->extractEntity(speech, "confirm", 3s);
+    if (confirmations.empty()) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Confirmation] No confirm.yaml match for response: '%s'",
+        speech.c_str());
+      return "";
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Confirmation] confirm.yaml matched '%s' -> '%s'",
+      speech.c_str(),
+      confirmations.front().c_str());
+    return confirmations.front();
+  }
+
   std::string listenYesNo()
   {
     // Confirmacion fuera del plan: usa directamente HRI/listener para no
-    // consumir otra instruccion del plan mientras se valida el dato.
+    // consumir otra instruccion del plan mientras se valida el dato. El audio
+    // se escucha libre y se clasifica con knowledge_bank/dictionaries/confirm.yaml.
     if (!listener_client_) {
       RCLCPP_ERROR(this->get_logger(), "[Confirmation] Listen client not initialized");
       return "";
@@ -1867,8 +2094,7 @@ private:
 
     auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
     request->enable = true;
-    // test.json contiene yes/no; cambiar esta gramatica si se crea una dedicada.
-    request->grammar = "test.json";
+    request->grammar = "";
 
     auto future = listener_client_->async_send_request(request);
     const auto status = future.wait_for(8s);
@@ -1887,7 +2113,7 @@ private:
       this->get_logger(),
       "[Confirmation] Heard yes/no response: '%s'",
       response->recognized_speech.c_str());
-    return response->recognized_speech;
+    return extractConfirmationAnswer(response->recognized_speech);
   }
 
   std::string normalizeConfirmationCommand(const std::string & text) const
@@ -1916,25 +2142,24 @@ private:
 
   bool isNoAnswer(const std::string & text) const
   {
-    const std::string command = normalizeConfirmationCommand(text);
-    // Exact matches for common single-word rejections.
-    if (command == "no" || command == "nope" || command == "wrong" ||
-        command == "incorrect" || command == "false" || command == "robot no")
-    {
-      return true;
-    }
-    // Prefix matches ("no, that's fine", "nope", etc.).
-    if (command.rfind("no ", 0U) == 0U || command.rfind("nope ", 0U) == 0U) {
-      return true;
-    }
-    // Substring matches for multi-word rejections.
-    // "that's wrong" → "that s wrong", "that's incorrect" → "that s incorrect".
-    if (command.find("wrong") != std::string::npos ||
-        command.find("incorrect") != std::string::npos)
-    {
-      return true;
-    }
-    return false;
+    return commandHasToken(text, "no") ||
+           commandHasToken(text, "nope") ||
+           commandHasToken(text, "wrong") ||
+           commandHasToken(text, "incorrect") ||
+           commandHasToken(text, "false");
+  }
+
+  bool isYesAnswer(const std::string & text) const
+  {
+    return commandHasToken(text, "yes") ||
+           commandHasToken(text, "yeah") ||
+           commandHasToken(text, "yep") ||
+           commandHasToken(text, "correct") ||
+           commandHasToken(text, "right") ||
+           commandHasToken(text, "affirmative") ||
+           commandHasToken(text, "ok") ||
+           commandHasToken(text, "okay") ||
+           commandHasToken(text, "confirmed");
   }
 
   void clearDataConfirmation()
