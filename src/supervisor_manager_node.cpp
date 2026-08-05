@@ -7,18 +7,25 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
 
+#include <head_interfaces/srv/move_head.hpp>
 #include <known_locations_interfaces/srv/locations_get.hpp>
 #include <listener_interfaces/srv/listen.hpp>
 #include <talker_interfaces/srv/talk.hpp>
 #include <planning_tools/Planning.hpp>
 
+#include "supervisor_manager/pnp_recovery.hpp"
+
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nlohmann/json.hpp>
+#include <tf2/exceptions.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -34,8 +41,12 @@ using namespace std::chrono_literals;
 class SupervisorManagerNode : public rclcpp::Node
 {
 public:
-  explicit SupervisorManagerNode(bool natural_language_planning)
+  explicit SupervisorManagerNode(
+    bool natural_language_planning,
+    std::optional<bool> ask_data_confirmation_override = std::nullopt)
   : Node("supervisor_manager_node"),
+    tf_buffer_(this->get_clock()),
+    tf_listener_(tf_buffer_),
     natural_language_planning_(natural_language_planning)
   {
     RCLCPP_INFO(this->get_logger(), "supervisor_manager_node: started");
@@ -43,6 +54,52 @@ public:
       this->get_logger(),
       "natural_language_planning=%s",
       natural_language_planning_ ? "true" : "false");
+
+    this->declare_parameter<std::string>("map_frame", "map");
+    this->declare_parameter<std::string>("base_frame", "base_link");
+    this->declare_parameter<double>("go_to_success_distance_tolerance_m", 0.75);
+    this->declare_parameter<bool>("ask_data_confirmation_enabled", false);
+    this->declare_parameter<double>("pnp_time_limit_sec", 420.0);
+    this->declare_parameter<double>("pnp_retry_min_remaining_sec", 60.0);
+    this->declare_parameter<double>("pnp_safety_margin_sec", 25.0);
+
+    this->get_parameter("map_frame", map_frame_);
+    this->get_parameter("base_frame", base_frame_);
+    this->get_parameter(
+      "go_to_success_distance_tolerance_m",
+      go_to_success_distance_tolerance_m_);
+    this->get_parameter(
+      "ask_data_confirmation_enabled",
+      ask_data_confirmation_enabled_);
+    this->get_parameter("pnp_time_limit_sec", pnp_time_limit_sec_);
+    this->get_parameter(
+      "pnp_retry_min_remaining_sec",
+      pnp_retry_min_remaining_sec_);
+    this->get_parameter("pnp_safety_margin_sec", pnp_safety_margin_sec_);
+
+    pnp_recovery_.configure(
+      pnp_time_limit_sec_,
+      pnp_retry_min_remaining_sec_,
+      pnp_safety_margin_sec_);
+
+    if (ask_data_confirmation_override.has_value()) {
+      ask_data_confirmation_enabled_ = *ask_data_confirmation_override;
+      this->set_parameter(
+        rclcpp::Parameter(
+          "ask_data_confirmation_enabled",
+          ask_data_confirmation_enabled_));
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "ask_data_confirmation_enabled=%s",
+      ask_data_confirmation_enabled_ ? "true" : "false");
+    RCLCPP_INFO(
+      this->get_logger(),
+      "pnp_time_limit_sec=%.1f retry_min_remaining_sec=%.1f safety_margin_sec=%.1f",
+      pnp_time_limit_sec_,
+      pnp_retry_min_remaining_sec_,
+      pnp_safety_margin_sec_);
 
     // --- Entradas ROS ---
     // /system/status indica si los modulos minimos estan disponibles.
@@ -116,6 +173,10 @@ public:
       "/nav_controller/go_to_location",
       rmw_qos_profile_services_default,
       hri_client_group_);
+    head_client_ = this->create_client<head_interfaces::srv::MoveHead>(
+      "/hardware/head/move_head",
+      rmw_qos_profile_services_default,
+      hri_client_group_);
 
     // --- Timer principal del FSM (10 Hz) ---
     timer_ = this->create_wall_timer(
@@ -151,12 +212,46 @@ private:
 
   enum class FollowGiftState : uint8_t
   {
-    // Sub-FSM local para el caso say instruct_follow_person
+    // Sub-FSM local para follow dinamico disparado por say instruct_follow_*,
     // sin consumir pasos fijos del plan CLIPS.
     IDLE,
+    WAIT_START_LISTEN,
     WAIT_FOLLOW_ENABLE,
+    WAIT_STOP_LISTEN,
     WAIT_FOLLOW_DISABLE,
     WAIT_DROP_GIFT
+  };
+
+  enum class TakeApproachRetryState : uint8_t
+  {
+    IDLE,
+    WAIT_APPROACH,
+    WAIT_TAKE_RETRY
+  };
+
+  enum class DropApproachRetryState : uint8_t
+  {
+    IDLE,
+    WAIT_APPROACH,
+    WAIT_DROP_RETRY
+  };
+
+  enum class PersonApproachRecoveryState : uint8_t
+  {
+    IDLE,
+    WAIT_PARTIAL_APPROACH,
+    WAIT_PREVENTIVE_FIND_POSE,
+    WAIT_FIND_POSE,
+    WAIT_APPROACH
+  };
+
+  enum class TakePnpRecoveryState : uint8_t
+  {
+    IDLE,
+    WAIT_APPROACH,
+    WAIT_ALIGN,
+    WAIT_FIND_OBJECT,
+    WAIT_TAKE_RETRY
   };
 
   struct SemanticValidationResult
@@ -166,6 +261,16 @@ private:
     bool command_aborted{false};
     std::string abort_reason;
     std::vector<std::string> invalid_destinations;
+  };
+
+  struct GoToArrivalVerification
+  {
+    bool applicable{false};
+    bool verified{false};
+    bool within_tolerance{true};
+    double distance_m{0.0};
+    std::string goal_frame;
+    std::string error_message;
   };
 
   // ===== One-shot init =====
@@ -292,6 +397,36 @@ private:
     return sayText("I did not understand your command. Please repeat the instruction.");
   }
 
+  bool askUserToRepeatSimplerCommand(int attempt)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user to repeat the command more simply, retry %d/%d...",
+      attempt,
+      MAX_NATURAL_LANGUAGE_LISTEN_RETRIES);
+    return sayText(
+      "Please repeat the same command, but use a simpler sentence.");
+  }
+
+  bool askCustomerForFinalCommandAttempt()
+  {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking customer for help before final command attempt...");
+    return sayText(
+      "I could not understand the command. I need the customer, please. "
+      "This is my last attempt. Please repeat the command clearly.");
+  }
+
+  bool askUserForDifferentNaturalLanguageCommand()
+  {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 0] Asking user for a different command after exhausted attempts...");
+    return sayText(
+      "I still could not understand that command. Please give me a different command.");
+  }
+
   bool askUserToRepeatInvalidDestinationCommand(
     const std::string & destination,
     int attempt)
@@ -329,6 +464,85 @@ private:
       "I still could not understand your command. "
       "I will restart the sequence from the beginning and navigate to the instruction point again.");
     at_instruction_point_ = false;
+  }
+
+  bool waitForCommandContinue()
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 0] Waiting for 'continue' before asking for the command...");
+
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(LISTEN_CONTINUE_TIMEOUT_SEC);
+    int attempt = 0;
+
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      ++attempt;
+
+      if (attempt == 1 || attempt % LISTEN_CONTINUE_REPROMPT_EVERY_RETRIES == 0) {
+        if (!sayText("Please say, continue, to proceed.")) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[Pipeline][Step 0] could not announce wait_for_command_continue through TTS");
+        }
+      }
+
+      if (!listener_client_) {
+        RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 0] Listen client not initialized");
+        return false;
+      }
+
+      if (!listener_client_->wait_for_service(1s)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[Pipeline][Step 0] Listen service unavailable while waiting for continue");
+        rclcpp::sleep_for(500ms);
+        continue;
+      }
+
+      auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
+      request->enable = true;
+      request->grammar = "";
+
+      auto future = listener_client_->async_send_request(request);
+      const auto status = future.wait_for(10s);
+      if (status != std::future_status::ready) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[Pipeline][Step 0] Listen timeout while waiting for continue");
+        continue;
+      }
+
+      const auto response = future.get();
+      if (!response->success) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[Pipeline][Step 0] Listen failed while waiting for continue");
+        continue;
+      }
+
+      const std::string text = response->recognized_speech;
+      if (listenContinueHeard(text)) {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[Pipeline][Step 0] Heard continue: \"%s\"",
+          text.c_str());
+        return true;
+      }
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Step 0] Ignoring response while waiting for continue: \"%s\"",
+        text.c_str());
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 0] Timed out after %d seconds without hearing continue",
+      LISTEN_CONTINUE_TIMEOUT_SEC);
+    sayText("I did not hear continue after three minutes. I will restart the instruction sequence.");
+    at_instruction_point_ = false;
+    return false;
   }
 
   std::string stepListen()
@@ -372,6 +586,36 @@ private:
     return text;
   }
 
+  bool confirmHeardCommand(const std::string & text)
+  {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 1] Confirming heard command with user: \"%s\"",
+      text.c_str());
+
+    if (!sayText("I heard: " + text + ". Is that correct?")) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Pipeline][Step 1] Could not ask command confirmation through TTS");
+      return false;
+    }
+
+    const std::string answer = listenYesNo();
+    if (isYesAnswer(answer)) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Pipeline][Step 1] User confirmed command with answer: \"%s\"",
+        answer.c_str());
+      return true;
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[Pipeline][Step 1] User did not confirm command. answer=\"%s\"",
+      answer.c_str());
+    return false;
+  }
+
   std::string stepParse(const std::string & text)
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 2] Parsing: \"%s\"", text.c_str());
@@ -382,7 +626,7 @@ private:
       return "";
     }
 
-    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 2] Semantic CD: \"%s\"", semantic.c_str());
+    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 2] Semantic response: \"%s\"", semantic.c_str());
     return semantic;
   }
 
@@ -402,9 +646,42 @@ private:
     const auto last = value.find_last_not_of(" \t\n\r");
     value = value.substr(first, last - first + 1);
 
+    auto strip_leading_articles = [](std::string token) {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        for (const char * prefix : {"the ", "a ", "an ", "the_", "a_", "an_"}) {
+          const std::string article(prefix);
+          if (token.rfind(article, 0U) == 0U && token.size() > article.size()) {
+            token = token.substr(article.size());
+            changed = true;
+            break;
+          }
+        }
+      }
+      return token;
+    };
+
+    value = strip_leading_articles(value);
     std::replace(value.begin(), value.end(), ' ', '_');
     std::replace(value.begin(), value.end(), '-', '_');
-    return value;
+    return strip_leading_articles(value);
+  }
+
+  void addKnownLocationToken(const std::string & raw_location)
+  {
+    const std::string location = normalizeKnowledgeToken(raw_location);
+    if (location.empty()) {
+      return;
+    }
+
+    known_locations_.insert(location);
+
+    std::string compact = location;
+    compact.erase(std::remove(compact.begin(), compact.end(), '_'), compact.end());
+    if (!compact.empty()) {
+      known_locations_.insert(compact);
+    }
   }
 
   bool loadKnownLocations()
@@ -430,10 +707,7 @@ private:
 
       for (const auto & category : root) {
         if (category.first.IsScalar()) {
-          const std::string location = normalizeKnowledgeToken(category.first.as<std::string>());
-          if (!location.empty()) {
-            known_locations_.insert(location);
-          }
+          addKnownLocationToken(category.first.as<std::string>());
         }
 
         if (!category.second.IsSequence()) {
@@ -445,10 +719,7 @@ private:
             continue;
           }
 
-          const std::string location = normalizeKnowledgeToken(item.as<std::string>());
-          if (!location.empty()) {
-            known_locations_.insert(location);
-          }
+          addKnownLocationToken(item.as<std::string>());
         }
       }
 
@@ -474,6 +745,15 @@ private:
     return destination == "unknown" ||
            destination == "user" ||
            destination == "person_recipient";
+  }
+
+  bool isSemanticLocationField(const std::string & field_name) const
+  {
+    return field_name == "destination" ||
+           field_name == "source" ||
+           field_name == "location" ||
+           field_name == "recipient_location" ||
+           field_name == "destination_location";
   }
 
   bool textMentionsUnknownDestination(const std::string & text) const
@@ -548,24 +828,25 @@ private:
     SemanticValidationResult & result)
   {
     if (value.is_object()) {
-      const auto destination = value.find("destination");
-      if (destination != value.end() && destination->is_string()) {
-        const std::string raw_destination = destination->get<std::string>();
-        const std::string normalized_destination = normalizeKnowledgeToken(raw_destination);
-
-        if (normalized_destination == "unknown") {
-          result.valid = false;
-          result.unknown_destination = true;
-        } else if (!known_locations_.empty() &&
-                   !isSpecialSemanticDestination(normalized_destination) &&
-                   known_locations_.find(normalized_destination) == known_locations_.end())
-        {
-          result.valid = false;
-          result.invalid_destinations.push_back(raw_destination);
-        }
-      }
-
       for (const auto & item : value.items()) {
+        if (isSemanticLocationField(item.key()) && item.value().is_string()) {
+          const std::string raw_location = item.value().get<std::string>();
+          const std::string normalized_location = normalizeKnowledgeToken(raw_location);
+
+          if (item.key() == "destination" && normalized_location == "unknown") {
+            result.valid = false;
+            result.unknown_destination = true;
+          } else if (!normalized_location.empty() &&
+                     normalized_location != "unknown" &&
+                     !isSpecialSemanticDestination(normalized_location) &&
+                     !known_locations_.empty() &&
+                     known_locations_.find(normalized_location) == known_locations_.end())
+          {
+            result.valid = false;
+            result.invalid_destinations.push_back(raw_location);
+          }
+        }
+
         validateJsonDestinations(item.value(), result);
       }
       return;
@@ -621,17 +902,40 @@ private:
     return validation.invalid_destinations.front();
   }
 
+  bool semanticHasGoalsPayload(const std::string & semantic) const
+  {
+    try {
+      const auto parsed = nlohmann::json::parse(semantic);
+      return parsed.is_object() &&
+             parsed.contains("goals") &&
+             parsed["goals"].is_array();
+    } catch (const nlohmann::json::exception &) {
+      return false;
+    }
+  }
+
   std::string stepToClips(const std::string & semantic)
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] Converting to CLIPS: \"%s\"", semantic.c_str());
-    const std::string clips = planning_->primitiveToClips(semantic);
+    const bool use_goals_to_clips = semanticHasGoalsPayload(semantic);
+    const std::string clips = use_goals_to_clips
+      ? planning_->goalsToClips(semantic)
+      : planning_->primitiveToClips(semantic);
 
-    if (clips.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "[Pipeline][Step 3] primitiveToClips returned empty");
+    if (clips.empty() || clips.rfind("ERROR", 0U) == 0U) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[Pipeline][Step 3] %s failed: \"%s\"",
+        use_goals_to_clips ? "goalsToClips" : "primitiveToClips",
+        clips.c_str());
       return "";
     }
 
-    RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] CLIPS facts: \"%s\"", clips.c_str());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Pipeline][Step 3] %s response: \"%s\"",
+      use_goals_to_clips ? "goalsToClips" : "primitiveToClips",
+      clips.c_str());
     return clips;
   }
 
@@ -660,6 +964,11 @@ private:
         RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step -1: goToInstructionPoint failed");
         return false;
       }
+
+      if (!waitForCommandContinue()) {
+        RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: waitForCommandContinue failed");
+        return false;
+      }
     } else {
       RCLCPP_INFO(
         this->get_logger(),
@@ -672,90 +981,134 @@ private:
     }
 
     std::string semantic;
-    int invalid_destination_attempts = 0;
-    for (int retry = 0; retry <= MAX_NATURAL_LANGUAGE_LISTEN_RETRIES; ++retry) {
-      enum class RetryPrompt : uint8_t {RepeatCommand, RepeatInvalidDestination, DifferentCommand};
-      RetryPrompt retry_prompt = RetryPrompt::RepeatCommand;
-      std::string invalid_destination;
+    bool prompt_for_command = false;
 
-      const std::string text = stepListen();
-      if (text.empty()) {
-        RCLCPP_WARN(
-          this->get_logger(),
-          "Pipeline listen attempt %d/%d failed",
-          retry + 1,
-          MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
-      } else {
-        semantic = stepParse(text);
-        if (semantic.empty()) {
+    while (rclcpp::ok() && semantic.empty()) {
+      if (prompt_for_command && !promptForCommand()) {
+        RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: promptForCommand failed");
+        return false;
+      }
+      prompt_for_command = true;
+
+      int invalid_destination_attempts = 0;
+      for (int retry = 0; retry <= MAX_NATURAL_LANGUAGE_LISTEN_RETRIES; ++retry) {
+        enum class RetryPrompt : uint8_t {
+          RepeatCommand,
+          RepeatSimplerCommand,
+          RepeatInvalidDestination,
+          DifferentCommand
+        };
+        RetryPrompt retry_prompt = RetryPrompt::RepeatCommand;
+        std::string invalid_destination;
+
+        const std::string text = stepListen();
+        if (text.empty()) {
           RCLCPP_WARN(
             this->get_logger(),
-            "Pipeline semantic parse attempt %d/%d failed",
+            "Pipeline listen attempt %d/%d failed",
             retry + 1,
             MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
         } else {
-          const SemanticValidationResult validation = validateSemanticDestinations(semantic);
-          if (!validation.valid) {
-            if (validation.command_aborted) {
-              RCLCPP_WARN(
-                this->get_logger(),
-                "[Pipeline][Step 2] Semantic parser aborted command: %s",
-                validation.abort_reason.empty()
-                  ? "unknown validation error"
-                  : validation.abort_reason.c_str());
-            }
+          if (!confirmHeardCommand(text)) {
+            retry_prompt = RetryPrompt::RepeatSimplerCommand;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "Pipeline command confirmation attempt %d/%d failed",
+              retry + 1,
+              MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+          } else {
+            semantic = stepParse(text);
+          }
 
-            if (validation.unknown_destination) {
-              RCLCPP_WARN(
-                this->get_logger(),
-                "[Pipeline][Step 2] Semantic destination is unknown; asking for instruction again");
-            }
+          if (!semantic.empty()) {
+            const SemanticValidationResult validation = validateSemanticDestinations(semantic);
+            if (!validation.valid) {
+              if (validation.command_aborted) {
+                RCLCPP_WARN(
+                  this->get_logger(),
+                  "[Pipeline][Step 2] Semantic parser aborted command: %s",
+                  validation.abort_reason.empty()
+                    ? "unknown validation error"
+                    : validation.abort_reason.c_str());
+              }
 
-            if (!validation.invalid_destinations.empty()) {
-              ++invalid_destination_attempts;
-              invalid_destination = firstInvalidDestination(validation);
-              retry_prompt = invalid_destination_attempts >= 2
-                ? RetryPrompt::DifferentCommand
-                : RetryPrompt::RepeatInvalidDestination;
-              RCLCPP_WARN(
-                this->get_logger(),
-                "[Pipeline][Step 2] Semantic destination '%s' is not in knowledge_bank/domains/locations.yaml; attempt %d",
-                invalid_destination.c_str(),
-                invalid_destination_attempts);
-            }
+              if (validation.unknown_destination) {
+                RCLCPP_WARN(
+                  this->get_logger(),
+                  "[Pipeline][Step 2] Semantic destination is unknown; asking for instruction again");
+              }
 
-            semantic.clear();
+              if (!validation.invalid_destinations.empty()) {
+                ++invalid_destination_attempts;
+                invalid_destination = firstInvalidDestination(validation);
+                retry_prompt = invalid_destination_attempts >= 2
+                  ? RetryPrompt::DifferentCommand
+                  : RetryPrompt::RepeatInvalidDestination;
+                RCLCPP_WARN(
+                  this->get_logger(),
+                  "[Pipeline][Step 2] Semantic destination '%s' is not in knowledge_bank/domains/locations.yaml; attempt %d",
+                  invalid_destination.c_str(),
+                  invalid_destination_attempts);
+              }
+
+              semantic.clear();
+            }
+          } else if (retry_prompt == RetryPrompt::RepeatCommand) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "Pipeline semantic parse attempt %d/%d failed",
+              retry + 1,
+              MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+          }
+        }
+
+        if (!semantic.empty()) {
+          break;
+        }
+
+        if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES) {
+          bool prompt_ok = false;
+          if (retry + 1 == MAX_NATURAL_LANGUAGE_LISTEN_RETRIES) {
+            prompt_ok = askCustomerForFinalCommandAttempt();
+          } else {
+            switch (retry_prompt) {
+              case RetryPrompt::RepeatSimplerCommand:
+                prompt_ok = askUserToRepeatSimplerCommand(retry + 1);
+                break;
+              case RetryPrompt::RepeatInvalidDestination:
+                prompt_ok = askUserToRepeatInvalidDestinationCommand(
+                  invalid_destination,
+                  retry + 1);
+                break;
+              case RetryPrompt::DifferentCommand:
+                prompt_ok = askUserForDifferentCommand(
+                  invalid_destination,
+                  retry + 1);
+                break;
+              case RetryPrompt::RepeatCommand:
+              default:
+                prompt_ok = askUserToRepeatCommand(retry + 1);
+                break;
+            }
+          }
+
+          if (!prompt_ok) {
+            RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: retry prompt failed");
+            return false;
           }
         }
       }
 
-      if (!semantic.empty()) {
-        break;
-      }
-
-      if (retry < MAX_NATURAL_LANGUAGE_LISTEN_RETRIES) {
-        bool prompt_ok = false;
-        switch (retry_prompt) {
-          case RetryPrompt::RepeatInvalidDestination:
-            prompt_ok = askUserToRepeatInvalidDestinationCommand(
-              invalid_destination,
-              retry + 1);
-            break;
-          case RetryPrompt::DifferentCommand:
-            prompt_ok = askUserForDifferentCommand(
-              invalid_destination,
-              retry + 1);
-            break;
-          case RetryPrompt::RepeatCommand:
-          default:
-            prompt_ok = askUserToRepeatCommand(retry + 1);
-            break;
-        }
-
-        if (!prompt_ok) {
-          RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: retry prompt failed");
+      if (semantic.empty()) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "Pipeline exhausted %d command attempts; requesting a different command",
+          MAX_NATURAL_LANGUAGE_LISTEN_RETRIES + 1);
+        if (!askUserForDifferentNaturalLanguageCommand()) {
+          RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 0: different-command prompt failed");
           return false;
         }
+        prompt_for_command = false;
       }
     }
 
@@ -772,7 +1125,7 @@ private:
 
     const std::string clips = stepToClips(semantic);
     if (clips.empty()) {
-      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 3: primitiveToClips returned empty");
+      RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step 3: CLIPS conversion failed");
       return false;
     }
 
@@ -941,6 +1294,19 @@ private:
     instruction_cmd_pub_->publish(msg);
   }
 
+  void publishSkipCommand(int count)
+  {
+    if (count <= 0) {
+      return;
+    }
+
+    // supervisor_plan interpreta valores negativos como "saltar N pasos
+    // normales" antes de entregar la siguiente instruccion ejecutable.
+    std_msgs::msg::Int32 msg;
+    msg.data = -count;
+    instruction_cmd_pub_->publish(msg);
+  }
+
   void publishOverrideInstruction(const std::string & instruction)
   {
     // Inyecta una instruccion temporal en supervisor_plan. Esa instruccion se
@@ -955,6 +1321,88 @@ private:
     // Publica el override y libera exactamente un ciclo plan->executor.
     publishOverrideInstruction(instruction);
     return publishAllowNextCycle();
+  }
+
+  bool executePnpCommand(const supervisor_manager::PnpRecoveryManager::Command & command)
+  {
+    using CommandType = supervisor_manager::PnpRecoveryManager::CommandType;
+
+    if (!command.handled()) {
+      return false;
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[PNP] command=%u instruction='%s' skip_count=%d reason='%s'",
+      static_cast<unsigned int>(command.type),
+      command.instruction.c_str(),
+      command.skip_count,
+      command.reason.c_str());
+
+    switch (command.type) {
+      case CommandType::ALLOW_NEXT:
+        publishAllowNextCycle();
+        return true;
+
+      case CommandType::DISPATCH_OVERRIDE:
+        if (command.instruction.empty()) {
+          RCLCPP_WARN(this->get_logger(), "[PNP] empty override command ignored");
+          return false;
+        }
+        dispatchOverrideInstruction(command.instruction);
+        return true;
+
+      case CommandType::SKIP_NEXT:
+        if (command.skip_count > 0) {
+          publishSkipCommand(command.skip_count);
+        }
+        publishAllowNextCycle();
+        return true;
+
+      case CommandType::FINISH:
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[PNP] final summary: %s",
+          pnp_recovery_.summaryReport(this->now()).c_str());
+        state_ = State::SM_FINISH;
+        return true;
+
+      case CommandType::NONE:
+      default:
+        return false;
+    }
+  }
+
+  bool handlePnpFeedback(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    supervisor_manager::PnpFeedback pnp_feedback;
+    pnp_feedback.action = feedback.action;
+    pnp_feedback.argument = feedback.argument;
+    pnp_feedback.worker_result = feedback.worker_result;
+    pnp_feedback.approved = feedback.approved;
+    pnp_feedback.take_recovery_context =
+      isTakeAction(feedback) &&
+      isSuccessfulFeedback(feedback) &&
+      take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_TAKE_RETRY &&
+      normalizeText(take_pnp_recovery_argument_) == normalizeText(feedback.argument);
+    pnp_feedback.status = feedback.status;
+
+    auto command = pnp_recovery_.handleFeedback(pnp_feedback, this->now());
+    if (command.handled() && isSuccessfulFeedback(feedback)) {
+      if (isTakeAction(feedback)) {
+        take_retry_pending_ = false;
+        take_retry_instruction_.clear();
+        take_approach_retry_state_ = TakeApproachRetryState::IDLE;
+        take_approach_retry_argument_.clear();
+        resetTakePnpRecovery();
+      }
+
+      if (isDropAction(feedback)) {
+        resetDropApproachRecovery();
+      }
+    }
+    return executePnpCommand(command);
   }
 
   bool isSuccessfulFeedback(
@@ -973,18 +1421,54 @@ private:
            normalizeText(feedback.argument) == argument;
   }
 
+  std::string followDestinationFromTrigger(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    if (normalizeText(feedback.action) != "say") {
+      return "";
+    }
+
+    static const std::string kPrefix = "instruct_follow_to_";
+    const std::string argument = normalizeKnowledgeToken(feedback.argument);
+    if (argument.rfind(kPrefix, 0U) != 0U || argument.size() <= kPrefix.size()) {
+      return "";
+    }
+
+    return argument.substr(kPrefix.size());
+  }
+
+  bool commandHasToken(const std::string & text, const std::string & expected_token) const
+  {
+    const std::string command = normalizeConfirmationCommand(text);
+    std::size_t start = 0;
+
+    while (start < command.size()) {
+      const std::size_t end = command.find(' ', start);
+      const std::size_t token_end = end == std::string::npos ? command.size() : end;
+      if (command.compare(start, token_end - start, expected_token) == 0) {
+        return true;
+      }
+
+      if (end == std::string::npos) {
+        break;
+      }
+      start = end + 1;
+    }
+
+    return false;
+  }
+
   bool answerHasStop(const std::string & text) const
   {
-    return normalizeText(text).find("stop") != std::string::npos;
+    return commandHasToken(text, "stop");
   }
 
   bool answerHasFollowOrContinue(const std::string & text) const
   {
     // La primera respuesta acepta follow o continue como permiso para activar
     // seguimiento humano.
-    const std::string answer = normalizeText(text);
-    return answer.find("follow") != std::string::npos ||
-           answer.find("continue") != std::string::npos;
+    return commandHasToken(text, "follow") ||
+           commandHasToken(text, "continue");
   }
 
   std::string listenFollowGiftAnswer()
@@ -1056,6 +1540,97 @@ private:
     return "";
   }
 
+  void waitForFollowGiftStop()
+  {
+    int attempt = 1;
+    while (rclcpp::ok()) {
+      if (attempt > 1 && attempt % FOLLOW_GIFT_STOP_REPROMPT_EVERY_ATTEMPTS == 0) {
+        sayText("Say stop when you want me to stop.");
+      }
+
+      const std::string answer = listenFollowGiftAnswer();
+      if (answerHasStop(answer)) {
+        return;
+      }
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[FollowGift] still waiting for stop; ignoring answer '%s' (attempt %d)",
+        answer.c_str(),
+        attempt);
+      ++attempt;
+    }
+  }
+
+  bool waitForFollowDestination(const std::string & destination)
+  {
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(FOLLOW_DESTINATION_TIMEOUT_SEC);
+    int poll_count = 0;
+
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      double robot_x = 0.0;
+      double robot_y = 0.0;
+      std::string error_message;
+      if (!lookupFramePositionInMap(base_frame_, robot_x, robot_y, error_message)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[FollowSequence] cannot monitor destination '%s': %s",
+          destination.c_str(),
+          error_message.c_str());
+      } else {
+        double goal_x = 0.0;
+        double goal_y = 0.0;
+        if (!lookupFramePositionInMap(destination, goal_x, goal_y, error_message)) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[FollowSequence] cannot monitor destination '%s': %s",
+            destination.c_str(),
+            error_message.c_str());
+        } else {
+          const double dx = goal_x - robot_x;
+          const double dy = goal_y - robot_y;
+          const double distance_m = std::sqrt(dx * dx + dy * dy);
+          if (distance_m <= go_to_success_distance_tolerance_m_) {
+            RCLCPP_INFO(
+              this->get_logger(),
+              "[FollowSequence] destination '%s' reached while following: %.2f m <= %.2f m",
+              destination.c_str(),
+              distance_m,
+              go_to_success_distance_tolerance_m_);
+            return true;
+          }
+
+          if (poll_count % FOLLOW_DESTINATION_LOG_EVERY_POLLS == 0) {
+            RCLCPP_INFO(
+              this->get_logger(),
+              "[FollowSequence] following to '%s': %.2f m remaining",
+              destination.c_str(),
+              distance_m);
+          }
+        }
+      }
+
+      ++poll_count;
+      rclcpp::sleep_for(std::chrono::milliseconds(FOLLOW_DESTINATION_POLL_MS));
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[FollowSequence] timeout monitoring follow destination '%s'",
+      destination.c_str());
+    return false;
+  }
+
+  void resetFollowGiftSequence()
+  {
+    follow_gift_state_ = FollowGiftState::IDLE;
+    follow_drop_after_stop_ = false;
+    follow_destination_.clear();
+    follow_start_listen_attempts_ = 0;
+    follow_stop_listen_attempts_ = 0;
+  }
+
   bool dispatchFollowGiftInstruction(
     const std::string & instruction,
     FollowGiftState next_state)
@@ -1063,40 +1638,47 @@ private:
     follow_gift_state_ = next_state;
     RCLCPP_INFO(
       this->get_logger(),
-      "[FollowGift] dispatching '%s'; next_state=%u",
+      "[FollowSequence] dispatching '%s'; next_state=%u",
       instruction.c_str(),
       static_cast<unsigned int>(follow_gift_state_));
     return dispatchOverrideInstruction(instruction);
   }
 
+  std::string followListenAnswer(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string stored_value = extractStoredListenValue(feedback.worker_result);
+    if (!stored_value.empty()) {
+      return stored_value;
+    }
+    return feedback.worker_result;
+  }
+
+  bool dispatchFollowListen(FollowGiftState next_state)
+  {
+    return dispatchFollowGiftInstruction("Justina listen follow", next_state);
+  }
+
   bool handleFollowGiftSequence(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
-    // Punto de entrada: cuando termina "say instruct_follow_person", el plan deja
+    // Punto de entrada: cuando termina un say instruct_follow_*, el plan deja
     // el control al manager para decidir dinamicamente segun lo que escuche.
+    const bool is_follow_gift_trigger =
+      feedbackMatches(feedback, "say", "instruct_follow_person");
+    const bool is_follow_only_trigger =
+      feedbackMatches(feedback, "say", "instruct_follow_only");
+    const std::string triggered_follow_destination = followDestinationFromTrigger(feedback);
+    const bool is_follow_destination_trigger = !triggered_follow_destination.empty();
     if (follow_gift_state_ == FollowGiftState::IDLE &&
-        feedbackMatches(feedback, "say", "instruct_follow_person") &&
+        (is_follow_gift_trigger || is_follow_only_trigger || is_follow_destination_trigger) &&
         isSuccessfulFeedback(feedback))
     {
-      const std::string answer = waitForFollowGiftAnswer(true);
-      if (answer == "stop") {
-        sayText("Understood. I am ready to leave the gift.");
-        return dispatchFollowGiftInstruction(
-          "Justina drop gift",
-          FollowGiftState::WAIT_DROP_GIFT);
-      }
-
-      if (answer.empty()) {
-        sayText("I could not understand the instruction. I will start following you.");
-      }
-
-      if (answer == "follow") {
-        sayText("Understood. I will start following you now.");
-      }
-
-      return dispatchFollowGiftInstruction(
-        "Justina follow enable",
-        FollowGiftState::WAIT_FOLLOW_ENABLE);
+      follow_drop_after_stop_ = is_follow_gift_trigger;
+      follow_destination_ = triggered_follow_destination;
+      follow_start_listen_attempts_ = 0;
+      follow_stop_listen_attempts_ = 0;
+      return dispatchFollowListen(FollowGiftState::WAIT_START_LISTEN);
     }
 
     if (follow_gift_state_ == FollowGiftState::IDLE) {
@@ -1105,24 +1687,124 @@ private:
 
     switch (follow_gift_state_)
     {
+      case FollowGiftState::WAIT_START_LISTEN:
+      {
+        if (!feedbackMatches(feedback, "listen", "follow")) {
+          return false;
+        }
+
+        ++follow_start_listen_attempts_;
+        const std::string answer = followListenAnswer(feedback);
+        const bool heard_stop = isSuccessfulFeedback(feedback) && answerHasStop(answer);
+        const bool heard_follow =
+          isSuccessfulFeedback(feedback) && answerHasFollowOrContinue(answer);
+
+        if (heard_stop) {
+          if (!follow_drop_after_stop_) {
+            sayText("Understood. I will not start following.");
+            resetFollowGiftSequence();
+            return false;
+          }
+          sayText("Understood. I am ready to leave the gift.");
+          return dispatchFollowGiftInstruction(
+            "Justina drop floor",
+            FollowGiftState::WAIT_DROP_GIFT);
+        }
+
+        if (!heard_follow) {
+          if (follow_start_listen_attempts_ < MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS) {
+            sayText("I could not understand. Please say follow, continue, or stop.");
+            return dispatchFollowListen(FollowGiftState::WAIT_START_LISTEN);
+          }
+
+          if (follow_destination_.empty()) {
+            sayText("I could not understand the instruction. I will start following you.");
+          } else {
+            sayText(
+              "I could not understand the instruction. I will start following you to " +
+              makeSpeechFriendly(follow_destination_) + ".");
+          }
+        }
+
+        if (heard_follow) {
+          if (follow_destination_.empty()) {
+            sayText("Understood. I will start following you now.");
+          } else {
+            sayText(
+              "Understood. I will follow you to " +
+              makeSpeechFriendly(follow_destination_) + ".");
+          }
+        }
+
+        return dispatchFollowGiftInstruction(
+          "Justina follow enable",
+          FollowGiftState::WAIT_FOLLOW_ENABLE);
+      }
+
       case FollowGiftState::WAIT_FOLLOW_ENABLE:
       {
-        // Cuando el seguimiento ya quedo activo, el manager escucha directo
-        // hasta oir stop, sin inyectar listen al plan.
+        // Cuando el seguimiento ya quedo activo, el manager encadena listen
+        // follow para usar knowledge_bank/dictionaries/follow.yaml.
         if (!feedbackMatches(feedback, "follow", "enable")) {
           return false;
         }
 
         if (!isSuccessfulFeedback(feedback)) {
-          follow_gift_state_ = FollowGiftState::IDLE;
+          resetFollowGiftSequence();
           return false;
         }
 
-        const std::string answer = waitForFollowGiftAnswer(false);
-        if (answer.empty()) {
-          sayText("I could not hear stop clearly. I will stop following now.");
-        } else if (answer == "stop") {
+        if (!follow_destination_.empty()) {
+          const bool arrived = waitForFollowDestination(follow_destination_);
+          if (arrived) {
+            sayText(
+              "We have arrived at " + makeSpeechFriendly(follow_destination_) +
+              ". I will stop following you.");
+          } else {
+            sayText(
+              "I could not confirm arrival at " + makeSpeechFriendly(follow_destination_) +
+              ". I will stop following you.");
+          }
+        } else {
+          follow_stop_listen_attempts_ = 0;
+          return dispatchFollowListen(FollowGiftState::WAIT_STOP_LISTEN);
+        }
+
+        if (follow_drop_after_stop_) {
           sayText("Understood. I am ready to leave the gift.");
+        } else if (follow_destination_.empty()) {
+          sayText("Understood. I will stop following you.");
+        }
+
+        return dispatchFollowGiftInstruction(
+          "Justina follow disable",
+          FollowGiftState::WAIT_FOLLOW_DISABLE);
+      }
+
+      case FollowGiftState::WAIT_STOP_LISTEN:
+      {
+        if (!feedbackMatches(feedback, "listen", "follow")) {
+          return false;
+        }
+
+        ++follow_stop_listen_attempts_;
+        const std::string answer = followListenAnswer(feedback);
+        if (!isSuccessfulFeedback(feedback) || !answerHasStop(answer)) {
+          if (follow_stop_listen_attempts_ % FOLLOW_GIFT_STOP_REPROMPT_EVERY_ATTEMPTS == 0) {
+            sayText("Say stop when you want me to stop.");
+          }
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[FollowGift] still waiting for stop; worker_result='%s' (attempt %d)",
+            feedback.worker_result.c_str(),
+            follow_stop_listen_attempts_);
+          return dispatchFollowListen(FollowGiftState::WAIT_STOP_LISTEN);
+        }
+
+        if (follow_drop_after_stop_) {
+          sayText("Understood. I am ready to leave the gift.");
+        } else {
+          sayText("Understood. I will stop following you.");
         }
 
         return dispatchFollowGiftInstruction(
@@ -1132,30 +1814,36 @@ private:
 
       case FollowGiftState::WAIT_FOLLOW_DISABLE:
       {
-        // Al detener el seguimiento, se encadena la entrega del regalo.
+        // Al detener el seguimiento, la variante gift encadena drop floor;
+        // la variante only vuelve al flujo normal del plan.
         if (!feedbackMatches(feedback, "follow", "disable")) {
           return false;
         }
 
         if (!isSuccessfulFeedback(feedback)) {
-          follow_gift_state_ = FollowGiftState::IDLE;
+          resetFollowGiftSequence();
+          return false;
+        }
+
+        if (!follow_drop_after_stop_) {
+          resetFollowGiftSequence();
           return false;
         }
 
         return dispatchFollowGiftInstruction(
-          "Justina drop gift",
+          "Justina drop floor",
           FollowGiftState::WAIT_DROP_GIFT);
       }
 
       case FollowGiftState::WAIT_DROP_GIFT:
       {
-        // La secuencia dinamica termina despues de ejecutar drop gift; desde aqui
+        // La secuencia dinamica termina despues de ejecutar drop floor; desde aqui
         // el manager vuelve al flujo normal del plan.
-        if (!feedbackMatches(feedback, "drop", "gift")) {
+        if (!feedbackMatches(feedback, "drop", "floor")) {
           return false;
         }
 
-        follow_gift_state_ = FollowGiftState::IDLE;
+        resetFollowGiftSequence();
         return false;
       }
 
@@ -1197,6 +1885,95 @@ private:
   {
     const std::string action = normalizeText(feedback.action);
     return action == "listen";
+  }
+
+  bool isListenContinueAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return isListenAction(feedback) && normalizeText(feedback.argument) == "continue";
+  }
+
+  bool listenContinueHeard(const std::string & worker_result) const
+  {
+    return commandHasToken(worker_result, "continue");
+  }
+
+  bool handleListenContinueGate(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (!isListenContinueAction(feedback)) {
+      return false;
+    }
+
+    if (feedback.approved &&
+        feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS &&
+        listenContinueHeard(feedback.worker_result))
+    {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[ListenContinue] Heard continue in worker_result='%s'; resuming normal plan",
+        feedback.worker_result.c_str());
+      resetListenContinueGateState();
+      return false;
+    }
+
+    if (!listen_continue_wait_active_) {
+      listen_continue_wait_active_ = true;
+      listen_continue_deadline_ =
+        this->now() + rclcpp::Duration::from_seconds(LISTEN_CONTINUE_TIMEOUT_SEC);
+    }
+
+    ++listen_continue_retry_count_;
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[ListenContinue] Waiting for 'continue' (retry #%d). worker='%s' approved=%s status=%u reason='%s'",
+      listen_continue_retry_count_,
+      feedback.worker_result.c_str(),
+      feedback.approved ? "true" : "false",
+      static_cast<unsigned int>(feedback.status),
+      feedback.failure_reason.c_str());
+
+    if (this->now() >= listen_continue_deadline_) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[ListenContinue] Timed out after %d seconds without hearing continue; advancing plan",
+        LISTEN_CONTINUE_TIMEOUT_SEC);
+
+      if (!sayText("I did not hear continue after three minutes. I will continue with the task.")) {
+        RCLCPP_WARN(this->get_logger(), "[ListenContinue] could not announce timeout through TTS");
+      }
+
+      resetListenContinueGateState();
+      publishAllowNextCycle();
+      return true;
+    }
+
+    if (listen_continue_retry_count_ == 1 ||
+        listen_continue_retry_count_ % LISTEN_CONTINUE_REPROMPT_EVERY_RETRIES == 0)
+    {
+      if (!sayText("Please say continue when you are ready.")) {
+        RCLCPP_WARN(this->get_logger(), "[ListenContinue] could not reprompt through TTS");
+      }
+    }
+
+    publishRetryCommand();
+    publishAllowNextCycle();
+    return true;
+  }
+
+  void resetListenContinueGate(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (!isListenContinueAction(feedback)) {
+      resetListenContinueGateState();
+    }
+  }
+
+  void resetListenContinueGateState()
+  {
+    listen_continue_retry_count_ = 0;
+    listen_continue_wait_active_ = false;
+    listen_continue_deadline_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   }
 
   bool isFullListenArgument(const std::string & argument) const
@@ -1256,20 +2033,55 @@ private:
       makeSpeechFriendly(listenAttributeFromArgument(listen_argument));
 
     if (attribute == "name") {
-      return "I understood your name is " + value + ". Is that correct?";
+      return "Your name is " + value + ". Is that correct?";
     }
 
     if (attribute == "drink") {
-      return "I understood your drink is " + value + ". Is that correct?";
+      return "Your drink is " + value + ". Is that correct?";
     }
 
-    return "I understood " + attribute + " as " + value + ". Is that correct?";
+    if (attribute == "order") {
+      return "Your order is " + value + ". Is that correct?";
+    }
+
+    return "Your " + makeSpeechFriendly(attribute) + " is " + value + ". Is that correct?";
+  }
+
+  std::string extractConfirmationAnswer(const std::string & speech)
+  {
+    if (speech.empty()) {
+      return "";
+    }
+
+    if (!planning_) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[Confirmation] Planning tool not initialized; cannot use confirm dictionary");
+      return "";
+    }
+
+    const auto confirmations = planning_->extractEntity(speech, "confirm", 3s);
+    if (confirmations.empty()) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[Confirmation] No confirm.yaml match for response: '%s'",
+        speech.c_str());
+      return "";
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[Confirmation] confirm.yaml matched '%s' -> '%s'",
+      speech.c_str(),
+      confirmations.front().c_str());
+    return confirmations.front();
   }
 
   std::string listenYesNo()
   {
     // Confirmacion fuera del plan: usa directamente HRI/listener para no
-    // consumir otra instruccion del plan mientras se valida el dato.
+    // consumir otra instruccion del plan mientras se valida el dato. El audio
+    // se escucha libre y se clasifica con knowledge_bank/dictionaries/confirm.yaml.
     if (!listener_client_) {
       RCLCPP_ERROR(this->get_logger(), "[Confirmation] Listen client not initialized");
       return "";
@@ -1282,8 +2094,7 @@ private:
 
     auto request = std::make_shared<listener_interfaces::srv::Listen::Request>();
     request->enable = true;
-    // test.json contiene yes/no; cambiar esta gramatica si se crea una dedicada.
-    request->grammar = "test.json";
+    request->grammar = "";
 
     auto future = listener_client_->async_send_request(request);
     const auto status = future.wait_for(8s);
@@ -1302,26 +2113,53 @@ private:
       this->get_logger(),
       "[Confirmation] Heard yes/no response: '%s'",
       response->recognized_speech.c_str());
-    return response->recognized_speech;
+    return extractConfirmationAnswer(response->recognized_speech);
   }
 
-  bool isYesAnswer(const std::string & text) const
+  std::string normalizeConfirmationCommand(const std::string & text) const
   {
+    // Para la confirmacion solo un "no" directo corrige el dato; lo demas avanza.
     const std::string normalized = normalizeText(text);
-    return normalized.find("yes") != std::string::npos ||
-           normalized.find("yeah") != std::string::npos ||
-           normalized.find("correct") != std::string::npos ||
-           normalized.find("right") != std::string::npos ||
-           normalized.find("continue") != std::string::npos;
+    std::string command;
+    bool last_was_space = true;
+
+    for (unsigned char c : normalized) {
+      if (std::isalnum(c)) {
+        command.push_back(static_cast<char>(c));
+        last_was_space = false;
+      } else if (!last_was_space) {
+        command.push_back(' ');
+        last_was_space = true;
+      }
+    }
+
+    if (!command.empty() && command.back() == ' ') {
+      command.pop_back();
+    }
+
+    return command;
   }
 
   bool isNoAnswer(const std::string & text) const
   {
-    const std::string normalized = normalizeText(text);
-    return normalized.find("no") != std::string::npos ||
-           normalized.find("nope") != std::string::npos ||
-           normalized.find("wrong") != std::string::npos ||
-           normalized.find("incorrect") != std::string::npos;
+    return commandHasToken(text, "no") ||
+           commandHasToken(text, "nope") ||
+           commandHasToken(text, "wrong") ||
+           commandHasToken(text, "incorrect") ||
+           commandHasToken(text, "false");
+  }
+
+  bool isYesAnswer(const std::string & text) const
+  {
+    return commandHasToken(text, "yes") ||
+           commandHasToken(text, "yeah") ||
+           commandHasToken(text, "yep") ||
+           commandHasToken(text, "correct") ||
+           commandHasToken(text, "right") ||
+           commandHasToken(text, "affirmative") ||
+           commandHasToken(text, "ok") ||
+           commandHasToken(text, "okay") ||
+           commandHasToken(text, "confirmed");
   }
 
   void clearDataConfirmation()
@@ -1425,40 +2263,37 @@ private:
     pending_confirmation_value_ = value;
     ++confirmation_attempts_;
 
+    if (!ask_data_confirmation_enabled_) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Confirmation] Accepting '%s'='%s' without spoken confirmation because ask_data_confirmation_enabled=false",
+        pending_confirmation_listen_argument_.c_str(),
+        pending_confirmation_value_.c_str());
+      clearDataConfirmation();
+      return false;
+    }
+
     const std::string phrase = confirmationPhrase(
       pending_confirmation_listen_argument_,
       pending_confirmation_value_);
 
-    // Si el yes/no no se entiende, se repite solo la confirmacion. No volvemos
-    // a pedir el dato completo a menos que el usuario responda explicitamente no.
-    for (int yes_no_attempt = 1;
-         yes_no_attempt <= MAX_CONFIRMATION_ATTEMPTS;
-         ++yes_no_attempt)
-    {
-      if (yes_no_attempt > 1) {
-        sayText("I could not understand if that was correct. " + phrase);
-      } else {
-        sayText(phrase);
-      }
+    // Una sola confirmacion: solo un "no" directo repite la captura. Silencio,
+    // ruido o cualquier otra respuesta se acepta para no bloquear el plan.
+    sayText(phrase);
+    const std::string answer = listenYesNo();
+    if (!isNoAnswer(answer)) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[Confirmation] Treating answer '%s' as confirmation for '%s'='%s'",
+        answer.c_str(),
+        pending_confirmation_listen_argument_.c_str(),
+        pending_confirmation_value_.c_str());
+      clearDataConfirmation();
+      return false;
+    }
 
-      const std::string answer = listenYesNo();
-      if (isYesAnswer(answer)) {
-        RCLCPP_INFO(
-          this->get_logger(),
-          "[Confirmation] User confirmed '%s'='%s'",
-          pending_confirmation_listen_argument_.c_str(),
-          pending_confirmation_value_.c_str());
-        clearDataConfirmation();
-        return false;
-      }
-
-      if (isNoAnswer(answer)) {
-        if (confirmation_attempts_ < MAX_CONFIRMATION_ATTEMPTS) {
-          return retryDataCapture();
-        }
-
-        break;
-      }
+    if (confirmation_attempts_ < MAX_CONFIRMATION_ATTEMPTS) {
+      return retryDataCapture();
     }
 
     bool active_plan = true;
@@ -1564,6 +2399,185 @@ private:
     return (action == "go_to" || action == "goto") &&
            feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS &&
            feedback.approved;
+  }
+
+  bool isNavigationFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string reason = normalizeText(feedback.failure_reason);
+    return (action == "go_to" || action == "goto") && reason == "navigation_failed";
+  }
+
+  bool isNavigationLocationNotFoundFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    if (!isNavigationFailure(feedback)) {
+      return false;
+    }
+
+    const std::string worker = normalizeText(feedback.worker_result);
+    return worker.find("location") != std::string::npos &&
+           worker.find("not found") != std::string::npos;
+  }
+
+  bool isBumperFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string worker = normalizeText(feedback.worker_result);
+    const std::string reason = normalizeText(feedback.failure_reason);
+    return worker.find("bumper") != std::string::npos ||
+           reason.find("bumper") != std::string::npos;
+  }
+
+  bool isFindPosePersonNotFound(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string worker = normalizeText(feedback.worker_result);
+    return action == "find_pose" &&
+           worker.size() >= std::strlen("_pose_not_found") &&
+           worker.rfind("_pose_not_found") == worker.size() - std::strlen("_pose_not_found");
+  }
+
+  bool isFindPersonAnybodyNotFound(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string argument = normalizeText(feedback.argument);
+    const std::string worker = normalizeText(feedback.worker_result);
+    return action == "find_person" &&
+           argument.rfind("anybody", 0U) == 0U &&
+           worker.rfind("person_not_found:", 0U) == 0U;
+  }
+
+  bool isFindObjectNotFound(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    const std::string worker = normalizeText(feedback.worker_result);
+    return action == "find_object" &&
+           worker.rfind("object_not_found:", 0U) == 0U;
+  }
+
+  void resetFindPersonAnybodyRetryState()
+  {
+    find_person_anybody_retry_count_ = 0;
+    find_person_anybody_retry_argument_.clear();
+  }
+
+  void resetFindObjectRetryState()
+  {
+    find_object_retry_count_ = 0;
+    find_object_retry_argument_.clear();
+  }
+
+  bool isAnalyzeFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    const std::string action = normalizeText(feedback.action);
+    return action == "analyze" || action == "analyze_objects" || action == "analyze_object";
+  }
+
+  void resetAnalyzeRetryState()
+  {
+    analyze_retry_count_ = 0;
+    analyze_retry_argument_.clear();
+  }
+
+  bool moveHeadForFindPersonRetryExhausted()
+  {
+    if (!head_client_) {
+      RCLCPP_ERROR(this->get_logger(), "[FindPersonRetry] Head client not initialized");
+      return false;
+    }
+
+    if (!head_client_->wait_for_service(1s)) {
+      RCLCPP_WARN(this->get_logger(), "[FindPersonRetry] Head service unavailable");
+      return false;
+    }
+
+    auto request = std::make_shared<head_interfaces::srv::MoveHead::Request>();
+    request->positions = {0.0, 0.2};
+
+    auto future = head_client_->async_send_request(request);
+    const auto status = future.wait_for(5s);
+    if (status != std::future_status::ready) {
+      RCLCPP_WARN(this->get_logger(), "[FindPersonRetry] Timeout moving head to [0.0, 0.2]");
+      return false;
+    }
+
+    const auto response = future.get();
+    if (!response->success) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[FindPersonRetry] Head move to [0.0, 0.2] failed: %s",
+        response->message.c_str());
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "[FindPersonRetry] Head moved to [0.0, 0.2]");
+    return true;
+  }
+
+  bool lookupFramePositionInMap(
+    const std::string & source_frame,
+    double & x,
+    double & y,
+    std::string & error_message)
+  {
+    try {
+      const auto tf = tf_buffer_.lookupTransform(
+        map_frame_,
+        source_frame,
+        tf2::TimePointZero,
+        500ms);
+
+      x = tf.transform.translation.x;
+      y = tf.transform.translation.y;
+      error_message.clear();
+      return true;
+    } catch (const tf2::TransformException & ex) {
+      error_message =
+        "cannot lookup TF " + map_frame_ + " -> " + source_frame + ": " + ex.what();
+      return false;
+    }
+  }
+
+  GoToArrivalVerification verifySuccessfulGoToArrival(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    GoToArrivalVerification result;
+    if (!isSuccessfulGoTo(feedback)) {
+      return result;
+    }
+
+    result.applicable = true;
+    result.goal_frame = normalizeKnowledgeToken(feedback.argument);
+    if (result.goal_frame.empty()) {
+      result.error_message = "go_to destination is empty after normalization";
+      return result;
+    }
+
+    double robot_x = 0.0;
+    double robot_y = 0.0;
+    if (!lookupFramePositionInMap(base_frame_, robot_x, robot_y, result.error_message)) {
+      return result;
+    }
+
+    double goal_x = 0.0;
+    double goal_y = 0.0;
+    if (!lookupFramePositionInMap(result.goal_frame, goal_x, goal_y, result.error_message)) {
+      return result;
+    }
+
+    const double dx = goal_x - robot_x;
+    const double dy = goal_y - robot_y;
+
+    result.distance_m = std::sqrt(dx * dx + dy * dy);
+    result.verified = true;
+    result.within_tolerance = result.distance_m <= go_to_success_distance_tolerance_m_;
+    return result;
   }
 
   void updateInstructionPointStateFromGoTo(
@@ -1676,6 +2690,875 @@ private:
     return makeSpeechFriendly(fallback_reason);
   }
 
+  bool isTakeAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "take";
+  }
+
+  bool isDropAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "drop";
+  }
+
+  bool isApproachAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "approach";
+  }
+
+  bool isApproachPartialAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "approach_partial";
+  }
+
+  bool isFindPoseAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return normalizeText(feedback.action) == "find_pose";
+  }
+
+  bool customerIndexFromApproachArgument(
+    const std::string & argument,
+    std::string & index) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(argument);
+    constexpr const char * prefix = "customer_";
+    if (normalized.rfind(prefix, 0U) != 0U ||
+        normalized.size() <= std::strlen(prefix))
+    {
+      return false;
+    }
+
+    index = normalized.substr(std::strlen(prefix));
+    return std::all_of(
+      index.begin(),
+      index.end(),
+      [](unsigned char c) {return std::isdigit(c) != 0;});
+  }
+
+  bool isCustomerApproachAction(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback,
+    std::string & customer_index) const
+  {
+    return isApproachAction(feedback) &&
+           customerIndexFromApproachArgument(feedback.argument, customer_index);
+  }
+
+  std::string findPoseArgumentForCustomerIndex(
+    const std::string & customer_index) const
+  {
+    return "waving_" + customer_index;
+  }
+
+  bool customerIndexFromFindPoseArgument(
+    const std::string & argument,
+    std::string & index) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(argument);
+    constexpr const char * prefix = "waving_";
+    if (normalized.rfind(prefix, 0U) != 0U ||
+        normalized.size() <= std::strlen(prefix))
+    {
+      return false;
+    }
+
+    index = normalized.substr(std::strlen(prefix));
+    return std::all_of(
+      index.begin(),
+      index.end(),
+      [](unsigned char c) {return std::isdigit(c) != 0;});
+  }
+
+  std::string customerApproachArgumentForIndex(
+    const std::string & customer_index) const
+  {
+    return "customer_" + customer_index;
+  }
+
+  std::string findPoseDescription(const std::string & argument) const
+  {
+    std::string normalized = normalizeKnowledgeToken(argument);
+    const std::size_t sep = normalized.rfind('_');
+    if (sep != std::string::npos && sep + 1 < normalized.size()) {
+      const std::string suffix = normalized.substr(sep + 1);
+      const bool numeric_suffix = std::all_of(
+        suffix.begin(),
+        suffix.end(),
+        [](unsigned char c) {return std::isdigit(c) != 0;});
+      if (numeric_suffix) {
+        normalized = normalized.substr(0, sep);
+      }
+    }
+
+    std::replace(normalized.begin(), normalized.end(), '_', ' ');
+    return normalized.empty() ? "with the requested pose" : normalized;
+  }
+
+  bool promptFindPoseTarget(const std::string & find_pose_argument)
+  {
+    const std::string pose = findPoseDescription(find_pose_argument);
+    return sayText(
+      "I need to confirm your position. I am looking for the person " +
+      pose + ". Please raise your hand and keep it raised.");
+  }
+
+  bool isTakePoseOutOfRangeFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return isTakeAction(feedback) &&
+           normalizeText(feedback.worker_result) == "pose_out_of_range";
+  }
+
+  bool isDropPoseOutOfRangeFailure(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
+  {
+    return isDropAction(feedback) &&
+           normalizeText(feedback.worker_result) == "pose_out_of_range";
+  }
+
+  bool isJustinaTakeInstruction(const std::string & instruction) const
+  {
+    const std::string normalized = normalizeText(instruction);
+    return normalized.rfind("justina take ", 0U) == 0U;
+  }
+
+  bool isJustinaDropInstruction(const std::string & instruction) const
+  {
+    const std::string normalized = normalizeText(instruction);
+    return normalized.rfind("justina drop ", 0U) == 0U;
+  }
+
+  std::string takeRetryInstructionKey(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    const std::string current_instruction = getCurrentInstruction();
+    if (isJustinaTakeInstruction(current_instruction)) {
+      return current_instruction;
+    }
+
+    if (isTakeAction(feedback) && !feedback.argument.empty()) {
+      return "Justina take " + feedback.argument;
+    }
+
+    return "";
+  }
+
+  std::string dropRetryInstructionKey(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Conservamos la instruccion completa original ("Justina drop cutlery_1")
+    // para reintentar el mismo objeto despues de acercarnos a safe_drop_1.
+    const std::string current_instruction = getCurrentInstruction();
+    if (isJustinaDropInstruction(current_instruction)) {
+      return current_instruction;
+    }
+
+    if (isDropAction(feedback) && !feedback.argument.empty()) {
+      return "Justina drop " + feedback.argument;
+    }
+
+    return "";
+  }
+
+  void resetDropApproachRecovery()
+  {
+    drop_retry_pending_ = false;
+    drop_retry_instruction_.clear();
+    drop_approach_retry_state_ = DropApproachRetryState::IDLE;
+    drop_approach_retry_argument_.clear();
+  }
+
+  bool handleTakeFailureRetry(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (!isTakeAction(feedback)) {
+      return false;
+    }
+
+    // PNP recovery is already managing this take failure; don't interfere.
+    if (take_pnp_recovery_state_ != TakePnpRecoveryState::IDLE) {
+      return false;
+    }
+
+    const std::string instruction_key = takeRetryInstructionKey(feedback);
+    if (instruction_key.empty()) {
+      return false;
+    }
+
+    const std::string normalized_key = normalizeText(instruction_key);
+    if (take_retry_pending_ && normalizeText(take_retry_instruction_) == normalized_key) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakeRetry] Retry also failed for '%s'; continuing with normal failure path",
+        instruction_key.c_str());
+      take_retry_pending_ = false;
+      take_retry_instruction_.clear();
+      return false;
+    }
+
+    take_retry_pending_ = true;
+    take_retry_instruction_ = instruction_key;
+
+    if (isTakePoseOutOfRangeFailure(feedback)) {
+      take_approach_retry_state_ = TakeApproachRetryState::WAIT_APPROACH;
+      take_approach_retry_argument_ = feedback.argument;
+
+      const std::string approach_instruction =
+        "Justina approach " + feedback.argument;
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakeRetry] Take target is out of range; injecting approach before retry: '%s'",
+        approach_instruction.c_str());
+
+      if (!sayText("I need to get closer first.")) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[TakeRetry] could not announce approach recovery through TTS");
+      }
+
+      return dispatchOverrideInstruction(approach_instruction);
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[TakeRetry] Retrying failed take instruction once: '%s'",
+      take_retry_instruction_.c_str());
+
+    if (!sayText("I will try once more.")) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakeRetry] could not announce take retry through TTS");
+    }
+
+    publishRetryCommand();
+    publishAllowNextCycle();
+    return true;
+  }
+
+  bool handleTakeApproachRecovery(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (take_approach_retry_state_ == TakeApproachRetryState::IDLE) {
+      return false;
+    }
+
+    const std::string retry_argument = normalizeText(take_approach_retry_argument_);
+
+    if (take_approach_retry_state_ == TakeApproachRetryState::WAIT_APPROACH) {
+      if (!isApproachAction(feedback) ||
+          normalizeText(feedback.argument) != retry_argument)
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[TakeRetry] Approach recovery failed for '%s'; continuing with normal failure path",
+          take_approach_retry_argument_.c_str());
+        take_approach_retry_state_ = TakeApproachRetryState::IDLE;
+        take_approach_retry_argument_.clear();
+        take_retry_pending_ = false;
+        take_retry_instruction_.clear();
+        return false;
+      }
+
+      take_approach_retry_state_ = TakeApproachRetryState::WAIT_TAKE_RETRY;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[TakeRetry] Approach completed; retrying original take: '%s'",
+        take_retry_instruction_.c_str());
+      return dispatchOverrideInstruction(take_retry_instruction_);
+    }
+
+    if (take_approach_retry_state_ == TakeApproachRetryState::WAIT_TAKE_RETRY) {
+      if (!isTakeAction(feedback) ||
+          normalizeText(feedback.argument) != retry_argument)
+      {
+        return false;
+      }
+
+      take_approach_retry_state_ = TakeApproachRetryState::IDLE;
+      take_approach_retry_argument_.clear();
+      return false;
+    }
+
+    return false;
+  }
+
+  bool handleDropFailureRetry(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Drop solo pide recuperacion cuando la marca de manipulacion queda fuera
+    // de rango. En ese caso insertamos approach safe_drop_1 y reintentamos una
+    // vez el drop original.
+    if (!isDropPoseOutOfRangeFailure(feedback)) {
+      return false;
+    }
+
+    const std::string instruction_key = dropRetryInstructionKey(feedback);
+    if (instruction_key.empty()) {
+      return false;
+    }
+
+    const std::string normalized_key = normalizeText(instruction_key);
+    if (drop_retry_pending_ &&
+        normalizeText(drop_retry_instruction_) == normalized_key)
+    {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[DropRetry] Retry also failed for '%s'; continuing with normal failure path",
+        instruction_key.c_str());
+      resetDropApproachRecovery();
+      return false;
+    }
+
+    drop_retry_pending_ = true;
+    drop_retry_instruction_ = instruction_key;
+    drop_approach_retry_state_ = DropApproachRetryState::WAIT_APPROACH;
+    drop_approach_retry_argument_ = "safe_drop_1";
+
+    const std::string approach_instruction =
+      "Justina approach " + drop_approach_retry_argument_;
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[DropRetry] Drop target is out of range; injecting approach before retry: '%s'",
+      approach_instruction.c_str());
+
+    if (!sayText("I need to get closer to the drop point first.")) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[DropRetry] could not announce approach recovery through TTS");
+    }
+
+    return dispatchOverrideInstruction(approach_instruction);
+  }
+
+  bool handleDropApproachRecovery(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    // Pequena maquina de estados del retry:
+    // WAIT_APPROACH espera que termine approach safe_drop_1.
+    // WAIT_DROP_RETRY espera el resultado del drop original reinyectado.
+    if (drop_approach_retry_state_ == DropApproachRetryState::IDLE) {
+      return false;
+    }
+
+    const std::string retry_argument =
+      normalizeText(drop_approach_retry_argument_);
+
+    if (drop_approach_retry_state_ == DropApproachRetryState::WAIT_APPROACH) {
+      if (!isApproachAction(feedback) ||
+          normalizeText(feedback.argument) != retry_argument)
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[DropRetry] Approach recovery failed for '%s'; continuing with normal failure path",
+          drop_approach_retry_argument_.c_str());
+        resetDropApproachRecovery();
+        return false;
+      }
+
+      drop_approach_retry_state_ = DropApproachRetryState::WAIT_DROP_RETRY;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[DropRetry] Approach completed; retrying original drop: '%s'",
+        drop_retry_instruction_.c_str());
+      return dispatchOverrideInstruction(drop_retry_instruction_);
+    }
+
+    if (drop_approach_retry_state_ == DropApproachRetryState::WAIT_DROP_RETRY) {
+      if (!isDropAction(feedback)) {
+        return false;
+      }
+
+      drop_approach_retry_state_ = DropApproachRetryState::IDLE;
+      drop_approach_retry_argument_.clear();
+      return false;
+    }
+
+    return false;
+  }
+
+  // ===== Take PNP Recovery =====
+  // When take fails, injects approach + find_object + take as override
+  // instructions, up to MAX_TAKE_PNP_RECOVERY_ATTEMPTS times.
+  // On exhaustion the object is added to take_ignored_objects_ and the
+  // global plan resumes normally.
+
+  bool isTakeIgnored(const std::string & argument) const
+  {
+    return take_ignored_objects_.count(normalizeText(argument)) > 0;
+  }
+
+  void resetTakePnpRecovery()
+  {
+    take_pnp_recovery_state_ = TakePnpRecoveryState::IDLE;
+    take_pnp_recovery_argument_.clear();
+    take_pnp_recovery_count_ = 0;
+  }
+
+  bool handleTakePnpRecoveryStepFailure(const std::string & step)
+  {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[TakePnpRecovery] Recovery step '%s' failed for '%s' (attempt %d/%d)",
+      step.c_str(),
+      take_pnp_recovery_argument_.c_str(),
+      take_pnp_recovery_count_,
+      MAX_TAKE_PNP_RECOVERY_ATTEMPTS);
+
+    if (take_pnp_recovery_count_ < MAX_TAKE_PNP_RECOVERY_ATTEMPTS) {
+      ++take_pnp_recovery_count_;
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_APPROACH;
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakePnpRecovery] Retrying full recovery for '%s' (attempt %d/%d)",
+        take_pnp_recovery_argument_.c_str(),
+        take_pnp_recovery_count_,
+        MAX_TAKE_PNP_RECOVERY_ATTEMPTS);
+
+      if (!sayText("I will try once more.")) {
+        RCLCPP_WARN(this->get_logger(), "[TakePnpRecovery] TTS failed");
+      }
+
+      return dispatchOverrideInstruction("Justina approach " + take_pnp_recovery_argument_);
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "[TakePnpRecovery] Recovery exhausted for '%s'",
+      take_pnp_recovery_argument_.c_str());
+
+    if (pnp_recovery_.isManagedObject(take_pnp_recovery_argument_)) {
+      const std::string exhausted_object = take_pnp_recovery_argument_;
+      resetTakePnpRecovery();
+      auto command = pnp_recovery_.handleTakeRecoveryExhausted(
+        exhausted_object,
+        this->now());
+      return executePnpCommand(command);
+    }
+
+    take_ignored_objects_.insert(normalizeText(take_pnp_recovery_argument_));
+
+    if (!sayText(
+        "I could not pick up " + makeSpeechFriendly(take_pnp_recovery_argument_) +
+        " after several attempts. I will skip it."))
+    {
+      RCLCPP_WARN(this->get_logger(), "[TakePnpRecovery] TTS failed");
+    }
+
+    resetTakePnpRecovery();
+    publishAllowNextCycle();
+    return true;
+  }
+
+  bool handleTakePnpRecovery(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    const std::string argument = normalizeText(feedback.argument);
+    const std::string recovery_arg = normalizeText(take_pnp_recovery_argument_);
+
+    // IDLE: detect a new take failure and start the recovery sequence.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::IDLE) {
+      if (!isTakeAction(feedback) ||
+          feedback.approved ||
+          !isExecutionFailureStatus(feedback.status) ||
+          isTakeIgnored(feedback.argument))
+      {
+        return false;
+      }
+
+      take_pnp_recovery_argument_ = feedback.argument;
+      take_pnp_recovery_count_ = 1;
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_APPROACH;
+
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[TakePnpRecovery] Take '%s' failed; starting recovery attempt 1/%d",
+        feedback.argument.c_str(),
+        MAX_TAKE_PNP_RECOVERY_ATTEMPTS);
+
+      if (!sayText(
+          "I could not pick up " + makeSpeechFriendly(feedback.argument) +
+          ". I will approach and try again."))
+      {
+        RCLCPP_WARN(this->get_logger(), "[TakePnpRecovery] TTS failed");
+      }
+
+      return dispatchOverrideInstruction("Justina approach " + feedback.argument);
+    }
+
+    // WAIT_APPROACH: wait for approach result, then dispatch find_object.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_APPROACH) {
+      if (!isApproachAction(feedback) || argument != recovery_arg) {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        return handleTakePnpRecoveryStepFailure("approach");
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[TakePnpRecovery] Approach completed; finding object '%s'",
+        take_pnp_recovery_argument_.c_str());
+
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_ALIGN;
+      return dispatchOverrideInstruction(
+        "Justina align table");
+    }
+
+    // WAIT_ALING: wait for align result, then dispatch take.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_ALIGN) {
+      if (normalizeText(feedback.action) != "align" ||
+          normalizeText(feedback.argument) != "table") {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        return handleTakePnpRecoveryStepFailure("align");
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[TakePnpRecovery] Align completed; finding object '%s'",
+        take_pnp_recovery_argument_.c_str());
+
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_FIND_OBJECT;
+      return dispatchOverrideInstruction(
+        "Justina find_object " + take_pnp_recovery_argument_);
+    }
+
+    // WAIT_FIND_OBJECT: wait for find_object result, then dispatch take.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_FIND_OBJECT) {
+      if (normalizeText(feedback.action) != "find_object" || argument != recovery_arg) {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        return handleTakePnpRecoveryStepFailure("find_object");
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[TakePnpRecovery] Find object succeeded; retrying take '%s'",
+        take_pnp_recovery_argument_.c_str());
+
+      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_TAKE_RETRY;
+      return dispatchOverrideInstruction("Justina take " + take_pnp_recovery_argument_);
+    }
+
+    // WAIT_TAKE_RETRY: wait for the retried take result.
+    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_TAKE_RETRY) {
+      if (!isTakeAction(feedback) || argument != recovery_arg) {
+        return false;
+      }
+
+      if (isSuccessfulFeedback(feedback)) {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[TakePnpRecovery] Take '%s' succeeded during recovery; waiting for verify_take",
+          take_pnp_recovery_argument_.c_str());
+        return false;  // Let the normal success path advance the plan.
+      }
+
+      return handleTakePnpRecoveryStepFailure("take");
+    }
+
+    return false;
+  }
+
+  void resetPersonApproachRecovery()
+  {
+    person_approach_recovery_state_ = PersonApproachRecoveryState::IDLE;
+    person_approach_argument_.clear();
+    person_find_pose_argument_.clear();
+    person_find_pose_retry_count_ = 0;
+  }
+
+  bool handlePersonApproachRecovery(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    if (person_approach_recovery_state_ ==
+        PersonApproachRecoveryState::WAIT_PARTIAL_APPROACH)
+    {
+      if (!isApproachPartialAction(feedback) ||
+          normalizeKnowledgeToken(feedback.argument) !=
+            normalizeKnowledgeToken(person_approach_argument_))
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] preventive partial approach failed for '%s'; continuing with normal failure path",
+          person_approach_argument_.c_str());
+        resetPersonApproachRecovery();
+        return false;
+      }
+
+      person_approach_recovery_state_ =
+        PersonApproachRecoveryState::WAIT_PREVENTIVE_FIND_POSE;
+      person_find_pose_retry_count_ = 0;
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] partial approach completed; refreshing pose with find_pose '%s'",
+        person_find_pose_argument_.c_str());
+
+      if (!promptFindPoseTarget(person_find_pose_argument_)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] could not announce preventive find_pose prompt");
+      }
+
+      const std::string find_pose_instruction =
+        "Justina find_pose " + person_find_pose_argument_;
+      return dispatchOverrideInstruction(find_pose_instruction);
+    }
+
+    if (person_approach_recovery_state_ ==
+        PersonApproachRecoveryState::WAIT_PREVENTIVE_FIND_POSE)
+    {
+      if (!isFindPoseAction(feedback) ||
+          normalizeKnowledgeToken(feedback.argument) !=
+            normalizeKnowledgeToken(person_find_pose_argument_))
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        ++person_find_pose_retry_count_;
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] preventive find_pose '%s' failed (retry #%d).",
+          person_find_pose_argument_.c_str(),
+          person_find_pose_retry_count_);
+
+        if (person_find_pose_retry_count_ == 1 ||
+            person_find_pose_retry_count_ %
+              FIND_POSE_REPROMPT_EVERY_RETRIES == 0)
+        {
+          if (!promptFindPoseTarget(person_find_pose_argument_)) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "[PersonApproachRecovery] could not repeat preventive find_pose prompt");
+          }
+        }
+
+        publishRetryCommand();
+        publishAllowNextCycle();
+        return true;
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] preventive pose refresh completed; continuing normal plan");
+      person_preventive_refined_approach_argument_ = person_approach_argument_;
+      resetPersonApproachRecovery();
+      find_pose_retry_count_ = 0;
+      publishAllowNextCycle();
+      return true;
+    }
+
+    if (person_approach_recovery_state_ ==
+        PersonApproachRecoveryState::WAIT_FIND_POSE)
+    {
+      if (!isFindPoseAction(feedback) ||
+          normalizeKnowledgeToken(feedback.argument) !=
+            normalizeKnowledgeToken(person_find_pose_argument_))
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        ++person_find_pose_retry_count_;
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] find_pose '%s' did not confirm the person (retry #%d).",
+          person_find_pose_argument_.c_str(),
+          person_find_pose_retry_count_);
+
+        if (person_find_pose_retry_count_ == 1 ||
+            person_find_pose_retry_count_ %
+              FIND_POSE_REPROMPT_EVERY_RETRIES == 0)
+        {
+          if (!promptFindPoseTarget(person_find_pose_argument_)) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "[PersonApproachRecovery] could not repeat find_pose prompt");
+          }
+        }
+
+        publishRetryCommand();
+        publishAllowNextCycle();
+        return true;
+      }
+
+      person_approach_recovery_state_ =
+        PersonApproachRecoveryState::WAIT_APPROACH;
+      person_find_pose_retry_count_ = 0;
+      find_pose_retry_count_ = 0;
+
+      const std::string approach_instruction =
+        "Justina approach " + person_approach_argument_;
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] find_pose confirmed target; refining approach with '%s'",
+        approach_instruction.c_str());
+
+      return dispatchOverrideInstruction(approach_instruction);
+    }
+
+    if (person_approach_recovery_state_ ==
+        PersonApproachRecoveryState::WAIT_APPROACH)
+    {
+      if (!isApproachAction(feedback) ||
+          normalizeKnowledgeToken(feedback.argument) !=
+            normalizeKnowledgeToken(person_approach_argument_))
+      {
+        return false;
+      }
+
+      if (!isSuccessfulFeedback(feedback)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] approach failed for '%s'; re-finding pose '%s' to retry",
+          person_approach_argument_.c_str(),
+          person_find_pose_argument_.c_str());
+
+        person_approach_recovery_state_ = PersonApproachRecoveryState::WAIT_FIND_POSE;
+        person_find_pose_retry_count_ = 0;
+
+        if (!promptFindPoseTarget(person_find_pose_argument_)) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[PersonApproachRecovery] could not announce find_pose prompt after approach failure");
+        }
+
+        const std::string find_pose_instruction =
+          "Justina find_pose " + person_find_pose_argument_;
+        return dispatchOverrideInstruction(find_pose_instruction);
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] refined approach completed for '%s'",
+        person_approach_argument_.c_str());
+      resetPersonApproachRecovery();
+      nav_retry_count_ = 0;
+      publishAllowNextCycle();
+      return true;
+    }
+
+    if (!isSuccessfulFeedback(feedback)) {
+      std::string customer_index;
+      if (isCustomerApproachAction(feedback, customer_index)) {
+        person_preventive_refined_approach_argument_.clear();
+        person_approach_argument_ = normalizeKnowledgeToken(feedback.argument);
+        person_find_pose_argument_ = findPoseArgumentForCustomerIndex(customer_index);
+        person_find_pose_retry_count_ = 0;
+        person_approach_recovery_state_ = PersonApproachRecoveryState::WAIT_FIND_POSE;
+
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[PersonApproachRecovery] approach '%s' failed from plan; re-finding pose '%s'",
+          feedback.argument.c_str(),
+          person_find_pose_argument_.c_str());
+
+        if (!promptFindPoseTarget(person_find_pose_argument_)) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[PersonApproachRecovery] could not announce find_pose prompt after approach failure");
+        }
+
+        const std::string find_pose_instruction =
+          "Justina find_pose " + person_find_pose_argument_;
+        return dispatchOverrideInstruction(find_pose_instruction);
+      }
+      return false;
+    }
+
+    if (isFindPoseAction(feedback)) {
+      std::string customer_index;
+      if (!customerIndexFromFindPoseArgument(feedback.argument, customer_index)) {
+        return false;
+      }
+
+      person_approach_argument_ =
+        customerApproachArgumentForIndex(customer_index);
+      person_find_pose_argument_ =
+        findPoseArgumentForCustomerIndex(customer_index);
+      person_find_pose_retry_count_ = 0;
+      person_approach_recovery_state_ =
+        PersonApproachRecoveryState::WAIT_PARTIAL_APPROACH;
+
+      const std::string partial_instruction =
+        "Justina approach_partial " + person_approach_argument_;
+
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] find_pose '%s' succeeded; inserting preventive partial approach '%s'",
+        feedback.argument.c_str(),
+        partial_instruction.c_str());
+
+      return dispatchOverrideInstruction(partial_instruction);
+    }
+
+    std::string customer_index;
+    if (!isCustomerApproachAction(feedback, customer_index)) {
+      return false;
+    }
+
+    person_approach_argument_ = normalizeKnowledgeToken(feedback.argument);
+    if (!person_preventive_refined_approach_argument_.empty() &&
+        person_approach_argument_ ==
+          normalizeKnowledgeToken(person_preventive_refined_approach_argument_))
+    {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[PersonApproachRecovery] skipping post-arrival confirmation for '%s' because preventive refinement already succeeded",
+        person_approach_argument_.c_str());
+      person_preventive_refined_approach_argument_.clear();
+      return false;
+    }
+
+    person_find_pose_argument_ =
+      findPoseArgumentForCustomerIndex(customer_index);
+    person_find_pose_retry_count_ = 0;
+    nav_retry_count_ = 0;
+    person_approach_recovery_state_ =
+      PersonApproachRecoveryState::WAIT_FIND_POSE;
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[PersonApproachRecovery] customer approach reached; requesting pose confirmation with find_pose '%s'",
+      person_find_pose_argument_.c_str());
+
+    if (!promptFindPoseTarget(person_find_pose_argument_)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[PersonApproachRecovery] could not announce pose confirmation prompt");
+    }
+
+    const std::string find_pose_instruction =
+      "Justina find_pose " + person_find_pose_argument_;
+    return dispatchOverrideInstruction(find_pose_instruction);
+  }
+
   void announceFailureAndContinue(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback,
     const std::string & reason)
@@ -1695,18 +3578,18 @@ private:
       knows_plan_state ? "true" : "false",
       active_plan ? "true" : "false");
 
-    std::string spoken = "I could not complete action " + makeSpeechFriendly(feedback.action);
+    std::string spoken = makeSpeechFriendly(feedback.action);
     if (!feedback.argument.empty()) {
       spoken += " " + makeSpeechFriendly(feedback.argument);
     }
-    spoken += " because " + failureReasonForSpeech(feedback, reason) + ".";
+    spoken += " failed: " + failureReasonForSpeech(feedback, reason) + ".";
 
     // Si supervisor_plan ya reporto que no quedan instrucciones, no prometemos
     // un siguiente paso ni disparamos otro ciclo de ejecucion.
     if (knows_plan_state && !active_plan) {
-      spoken += " There are no more steps in the plan.";
+      spoken += " No more steps.";
     } else {
-      spoken += " I will continue with the next step.";
+      spoken += " Next step.";
     }
 
     if (!sayText(spoken)) {
@@ -1736,8 +3619,10 @@ private:
     // Instrucciones correctivas para fallos de escucha. El objetivo es decir
     // algo antes de repetir la instruccion original.
     if (action == "listen") {
-      if (argument == "name")     return "Justina say repeat_name";
-      if (argument == "drink")    return "Justina say repeat_drink";
+      const std::string attribute = listenAttributeFromArgument(argument);
+      if (attribute == "name")     return "Justina say repeat_name";
+      if (attribute == "drink")    return "Justina say repeat_drink";
+      if (attribute == "order")    return "Justina say repeat_order";
       return "Justina say please_repeat";   // fallback genérico
     }
     return "";
@@ -1854,6 +3739,7 @@ private:
           this->get_logger(),
           "SM_WAIT_PLAN_READY: supervisor_plan confirmed plan is ready"
         );
+        pnp_recovery_.reset(this->now());
         state_ = State::SM_POST_PLAN_TRIGGER;
         break;
       }
@@ -1923,6 +3809,13 @@ private:
 			corrective_pending_ = false;
 		}
 
+        if (handleListenContinueGate(feedback))
+        {
+          break;
+        }
+
+        resetListenContinueGate(feedback);
+
         if (isDoorClosedCheckFailure(feedback))
         {
           // Closed door is recoverable by human intervention, so do not announce
@@ -1936,9 +3829,183 @@ private:
           break;
         }
 
+        if (handleTakePnpRecovery(feedback))
+        {
+          break;
+        }
+
+        if (handleTakeApproachRecovery(feedback))
+        {
+          break;
+        }
+
+        if (handleDropApproachRecovery(feedback))
+        {
+          break;
+        }
+
+        if (handlePersonApproachRecovery(feedback))
+        {
+          break;
+        }
+
+        if (handlePnpFeedback(feedback))
+        {
+          break;
+        }
+
         if (!feedback.approved || isExecutionFailureStatus(feedback.status))
         {
           if (handleDataCaptureFailure(feedback)) {
+            break;
+          }
+
+          if (isFindPersonAnybodyNotFound(feedback))
+          {
+            const std::string normalized_argument = normalizeText(feedback.argument);
+            if (find_person_anybody_retry_argument_ != normalized_argument) {
+              find_person_anybody_retry_argument_ = normalized_argument;
+              find_person_anybody_retry_count_ = 0;
+            }
+
+            if (find_person_anybody_retry_count_ < MAX_FIND_PERSON_ANYBODY_RETRIES) {
+              ++find_person_anybody_retry_count_;
+              RCLCPP_WARN(
+                this->get_logger(),
+                "SM_WAIT_EXECUTION_RESULT: find_person '%s' did not find anybody (retry #%d/%d).",
+                feedback.argument.c_str(),
+                find_person_anybody_retry_count_,
+                MAX_FIND_PERSON_ANYBODY_RETRIES);
+              publishRetryCommand();
+              publishAllowNextCycle();
+              break;
+            }
+
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: find_person '%s' exhausted %d retries. Moving head to [0.0, 0.2] before continuing.",
+              feedback.argument.c_str(),
+              MAX_FIND_PERSON_ANYBODY_RETRIES);
+            moveHeadForFindPersonRetryExhausted();
+            resetFindPersonAnybodyRetryState();
+          }
+
+          if (isFindObjectNotFound(feedback))
+          {
+            const std::string normalized_argument = normalizeText(feedback.argument);
+            if (find_object_retry_argument_ != normalized_argument) {
+              find_object_retry_argument_ = normalized_argument;
+              find_object_retry_count_ = 0;
+            }
+
+            if (find_object_retry_count_ < MAX_FIND_OBJECT_RETRIES) {
+              ++find_object_retry_count_;
+              RCLCPP_WARN(
+                this->get_logger(),
+                "SM_WAIT_EXECUTION_RESULT: find_object '%s' did not find the object (retry #%d/%d).",
+                feedback.argument.c_str(),
+                find_object_retry_count_,
+                MAX_FIND_OBJECT_RETRIES);
+              publishRetryCommand();
+              publishAllowNextCycle();
+              break;
+            }
+
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: find_object '%s' exhausted %d retries. Continuing.",
+              feedback.argument.c_str(),
+              MAX_FIND_OBJECT_RETRIES);
+            resetFindObjectRetryState();
+          }
+
+          if (isAnalyzeFailure(feedback))
+          {
+            const std::string normalized_argument = normalizeText(feedback.argument);
+            if (analyze_retry_argument_ != normalized_argument) {
+              analyze_retry_argument_ = normalized_argument;
+              analyze_retry_count_ = 0;
+            }
+
+            if (analyze_retry_count_ < MAX_ANALYZE_RETRIES) {
+              ++analyze_retry_count_;
+              RCLCPP_WARN(
+                this->get_logger(),
+                "SM_WAIT_EXECUTION_RESULT: analyze '%s' failed (retry #%d/%d).",
+                feedback.argument.c_str(),
+                analyze_retry_count_,
+                MAX_ANALYZE_RETRIES);
+              publishRetryCommand();
+              publishAllowNextCycle();
+              break;
+            }
+
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: analyze '%s' exhausted %d retries. Continuing.",
+              feedback.argument.c_str(),
+              MAX_ANALYZE_RETRIES);
+            resetAnalyzeRetryState();
+          }
+
+          if (isFindPosePersonNotFound(feedback))
+          {
+            ++find_pose_retry_count_;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: find_pose '%s' did not find a person (retry #%d). Retrying until success.",
+              feedback.argument.c_str(),
+              find_pose_retry_count_);
+
+            if (find_pose_retry_count_ == 1 ||
+                find_pose_retry_count_ % FIND_POSE_REPROMPT_EVERY_RETRIES == 0)
+            {
+              if (!promptFindPoseTarget(feedback.argument)) {
+                RCLCPP_WARN(
+                  this->get_logger(),
+                  "SM_WAIT_EXECUTION_RESULT: could not repeat find_pose prompt");
+              }
+            }
+
+            publishRetryCommand();
+            publishAllowNextCycle();
+            break;
+          }
+
+          // Navigation failures retry indefinitely until goal is reached.
+          // The only accepted stop is a bumper trigger.
+          if (isNavigationLocationNotFoundFailure(feedback))
+          {
+            nav_retry_count_ = 0;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: go_to '%s' references an unknown location; skipping retry. worker='%s'",
+              feedback.argument.c_str(),
+              feedback.worker_result.c_str());
+            announceFailureAndContinue(feedback, "navigation_failed - location not found");
+            break;
+          }
+
+          if (isNavigationFailure(feedback) && !isBumperFailure(feedback))
+          {
+            ++nav_retry_count_;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: navigation failed (retry #%d) for go_to '%s'. reason='%s' worker='%s' - retrying.",
+              nav_retry_count_,
+              feedback.argument.c_str(),
+              feedback.failure_reason.c_str(),
+              feedback.worker_result.c_str());
+            publishRetryCommand();
+            publishAllowNextCycle();
+            break;
+          }
+
+          if (handleTakeFailureRetry(feedback)) {
+            break;
+          }
+
+          if (handleDropFailureRetry(feedback)) {
             break;
           }
 
@@ -1965,13 +4032,28 @@ private:
         // En el bloque de retry:
 		if (needsApprovalRetry(feedback.action) && !feedback.approved)
 		{
+		  // For confirmation listens, only an explicit "no" phrase should trigger
+		  // a retry. Silence, unclear speech, or any non-negative response means
+		  // the user accepted, so proceed to the next instruction.
+		  if (normalizeText(feedback.action) == "listen" &&
+              normalizeText(feedback.argument) == "confirm" &&
+              !isNoAnswer(feedback.worker_result))
+          {
+            RCLCPP_INFO(
+              this->get_logger(),
+              "[Confirmation] listen confirm: non-negative response '%s'; treating as acceptance",
+              feedback.worker_result.c_str());
+            publishAllowNextCycle();
+            break;
+          }
+
 		  if (!corrective_pending_) {
 			  const std::string corrective =
 				getCorrectiveInstruction(feedback.action, feedback.argument);
 			  if (!corrective.empty()) {
 				// Rewind para que el listen se reintente después del say
 				rewind_pub_->publish(std_msgs::msg::Empty{});
-				
+
 				std_msgs::msg::String inj;
 				inj.data = corrective;
 				corrective_instruction_pub_->publish(inj);
@@ -1984,6 +4066,63 @@ private:
 
         if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
+          if (normalizeText(feedback.action) == "find_person") {
+            resetFindPersonAnybodyRetryState();
+          }
+
+          if (normalizeText(feedback.action) == "find_object") {
+            resetFindObjectRetryState();
+          }
+
+          if (normalizeText(feedback.action) == "analyze" ||
+              normalizeText(feedback.action) == "analyze_objects" ||
+              normalizeText(feedback.action) == "analyze_object") {
+            resetAnalyzeRetryState();
+          }
+
+          if (normalizeText(feedback.action) == "find_pose") {
+            find_pose_retry_count_ = 0;
+          }
+
+          const GoToArrivalVerification go_to_arrival = verifySuccessfulGoToArrival(feedback);
+          if (go_to_arrival.applicable && go_to_arrival.verified &&
+              !go_to_arrival.within_tolerance)
+          {
+            ++nav_retry_count_;
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: go_to '%s' reported success but robot is still %.2f m away from TF '%s' (tolerance %.2f m). Retrying navigation (#%d).",
+              feedback.argument.c_str(),
+              go_to_arrival.distance_m,
+              go_to_arrival.goal_frame.c_str(),
+              go_to_success_distance_tolerance_m_,
+              nav_retry_count_);
+            publishRetryCommand();
+            publishAllowNextCycle();
+            break;
+          }
+
+          if (go_to_arrival.applicable && !go_to_arrival.verified) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "SM_WAIT_EXECUTION_RESULT: go_to '%s' succeeded but arrival could not be verified against TF: %s. Accepting success.",
+              feedback.argument.c_str(),
+              go_to_arrival.error_message.c_str());
+          }
+
+          nav_retry_count_ = 0;
+          if (isTakeAction(feedback)) {
+            take_retry_pending_ = false;
+            take_retry_instruction_.clear();
+            take_approach_retry_state_ = TakeApproachRetryState::IDLE;
+            take_approach_retry_argument_.clear();
+            resetTakePnpRecovery();
+          }
+
+          if (isDropAction(feedback)) {
+            resetDropApproachRecovery();
+          }
+
           updateInstructionPointStateFromGoTo(feedback);
 
           if (door_waiting_active_ && isDoorOpenCheckSuccess(feedback)) {
@@ -2022,6 +4161,10 @@ private:
 
               if(!natural_language_planning_)
               {
+                auto pnp_finish_command = pnp_recovery_.handlePlanFinished(this->now());
+                if (executePnpCommand(pnp_finish_command)) {
+                  break;
+                }
                 state_ = State::SM_FINISH;
                 break;
               }
@@ -2088,8 +4231,11 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr corrective_instruction_pub_;
   rclcpp::CallbackGroup::SharedPtr hri_client_group_;
   rclcpp::Client<known_locations_interfaces::srv::LocationsGet>::SharedPtr goto_client_;
+  rclcpp::Client<head_interfaces::srv::MoveHead>::SharedPtr head_client_;
   rclcpp::Client<talker_interfaces::srv::Talk>::SharedPtr talker_client_;
   rclcpp::Client<listener_interfaces::srv::Listen>::SharedPtr listener_client_;
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
@@ -2102,6 +4248,14 @@ private:
   // false: usa un plan CLIPS ya definido. true: pide una orden hablada y genera
   // hechos CLIPS antes de planear.
   bool natural_language_planning_{false};
+  bool ask_data_confirmation_enabled_{true};
+  std::string map_frame_{"map"};
+  std::string base_frame_{"base_link"};
+  double go_to_success_distance_tolerance_m_{0.75};
+  double pnp_time_limit_sec_{420.0};
+  double pnp_retry_min_remaining_sec_{60.0};
+  double pnp_safety_margin_sec_{25.0};
+  supervisor_manager::PnpRecoveryManager pnp_recovery_;
   static constexpr int MAX_NATURAL_LANGUAGE_LISTEN_RETRIES = 3;
   bool at_instruction_point_{false};
   bool known_locations_loaded_{false};
@@ -2120,8 +4274,8 @@ private:
   bool corrective_pending_ = false;
 
   // Estado para confirmar datos guardados por patrones say ask_* + listen X.
-  // La cantidad maxima de intentos se define aqui.
-  static constexpr int MAX_CONFIRMATION_ATTEMPTS = 3;
+  // Permite la captura inicial y un solo reintento si el usuario dice "no".
+  static constexpr int MAX_CONFIRMATION_ATTEMPTS = 2;
   std::string pending_confirmation_ask_key_;
   std::string pending_confirmation_listen_argument_;
   std::string pending_confirmation_value_;
@@ -2134,10 +4288,69 @@ private:
   int door_open_request_count_{0};
   rclcpp::Time door_retry_time_{0, 0, RCL_ROS_TIME};
 
-  // Secuencia dinamica para recibir el regalo mientras sigue a una persona:
-  // say instruct_follow_person -> escucha directa del manager -> follow/drop segun respuesta.
+  // Conteo de reintentos de navegacion (go_to). Se resetea al exito.
+  // Solo un bumper activo acepta detener la navegacion permanentemente.
+  int nav_retry_count_{0};
+  int find_pose_retry_count_{0};
+  static constexpr int LISTEN_CONTINUE_TIMEOUT_SEC = 180;
+  static constexpr int LISTEN_CONTINUE_REPROMPT_EVERY_RETRIES = 3;
+  int listen_continue_retry_count_{0};
+  bool listen_continue_wait_active_{false};
+  rclcpp::Time listen_continue_deadline_{0, 0, RCL_ROS_TIME};
+  static constexpr int MAX_FIND_PERSON_ANYBODY_RETRIES = 2;
+  int find_person_anybody_retry_count_{0};
+  std::string find_person_anybody_retry_argument_;
+  static constexpr int MAX_FIND_OBJECT_RETRIES = 2;
+  int find_object_retry_count_{0};
+  std::string find_object_retry_argument_;
+  static constexpr int MAX_ANALYZE_RETRIES = 2;
+  int analyze_retry_count_{0};
+  std::string analyze_retry_argument_;
+  // Reintento unico para "Justina take <objeto>" antes de saltar al siguiente paso.
+  bool take_retry_pending_{false};
+  std::string take_retry_instruction_;
+  // Recuperacion especifica: si take reporta pose_out_of_range, primero acerca
+  // la base con approach y luego reintenta el mismo take una sola vez.
+  TakeApproachRetryState take_approach_retry_state_{TakeApproachRetryState::IDLE};
+  std::string take_approach_retry_argument_;
+  // Recuperacion equivalente para drop: si la marca de manipulacion esta fuera
+  // de rango, approach usa safe_drop_1 y luego se reintenta el drop original.
+  bool drop_retry_pending_{false};
+  std::string drop_retry_instruction_;
+  DropApproachRetryState drop_approach_retry_state_{DropApproachRetryState::IDLE};
+  std::string drop_approach_retry_argument_;
+  // Recuperacion PNP: ante cualquier fallo de take, ejecuta approach +
+  // find_object + take hasta MAX_TAKE_PNP_RECOVERY_ATTEMPTS veces; si se
+  // agota, el objeto se ignora y el plan continua.
+  static constexpr int MAX_TAKE_PNP_RECOVERY_ATTEMPTS = 2;
+  TakePnpRecoveryState take_pnp_recovery_state_{TakePnpRecoveryState::IDLE};
+  std::string take_pnp_recovery_argument_;
+  int take_pnp_recovery_count_{0};
+  std::unordered_set<std::string> take_ignored_objects_;
+  // Recuperacion para clientes/personas: despues de approach customer_N,
+  // pide confirmar waving_N, actualiza la pose con find_pose y acerca otra vez.
+  static constexpr int FIND_POSE_REPROMPT_EVERY_RETRIES = 3;
+  PersonApproachRecoveryState person_approach_recovery_state_{
+    PersonApproachRecoveryState::IDLE};
+  std::string person_approach_argument_;
+  std::string person_find_pose_argument_;
+  std::string person_preventive_refined_approach_argument_;
+  int person_find_pose_retry_count_{0};
+
+  // Secuencia dinamica para seguir a una persona:
+  // say instruct_follow_person -> follow -> stop -> drop floor.
+  // say instruct_follow_only -> follow -> stop.
+  // say instruct_follow_to_<dest> -> follow -> monitor dest -> stop.
   static constexpr int MAX_FOLLOW_GIFT_LISTEN_ATTEMPTS = 3;
+  static constexpr int FOLLOW_GIFT_STOP_REPROMPT_EVERY_ATTEMPTS = 3;
+  static constexpr int FOLLOW_DESTINATION_POLL_MS = 500;
+  static constexpr int FOLLOW_DESTINATION_LOG_EVERY_POLLS = 10;
+  static constexpr int FOLLOW_DESTINATION_TIMEOUT_SEC = 180;
   FollowGiftState follow_gift_state_{FollowGiftState::IDLE};
+  bool follow_drop_after_stop_{false};
+  std::string follow_destination_;
+  int follow_start_listen_attempts_{0};
+  int follow_stop_listen_attempts_{0};
 
   std::optional<supervisor_interfaces::msg::TaskExecutionReport> last_execution_feedback_;
   bool got_execution_feedback_{false};
@@ -2177,17 +4390,19 @@ bool parseBooleanValue(const std::string & value, bool & out)
   return false;
 }
 
-bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
+std::optional<bool> getBooleanArgFromArgv(
+  int argc,
+  char ** argv,
+  const std::string & key)
 {
   // Se parsea manualmente porque este nodo puede correrse con ros2 run o desde
-  // launch; soporta natural_language_planning=true y natural_language_planning:=true.
+  // launch; soporta key=true y key:=true.
   bool value = false;
   bool found = false;
 
   for (int i = 1; i < argc; ++i)
   {
     const std::string arg(argv[i]);
-    const std::string key = "natural_language_planning";
 
     if (arg.rfind(key + "=", 0) == 0 || arg.rfind(key + ":=", 0) == 0)
     {
@@ -2199,7 +4414,8 @@ bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
       if (!parsed) {
         RCLCPP_WARN(
           rclcpp::get_logger("supervisor_manager_node"),
-          "Invalid value for natural_language_planning: '%s'. Using default false.",
+          "Invalid value for %s: '%s'. Ignoring command-line override.",
+          key.c_str(),
           arg.c_str());
       } else {
         found = true;
@@ -2212,7 +4428,8 @@ bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
       if (!parseBooleanValue(argv[i + 2], value)) {
         RCLCPP_WARN(
           rclcpp::get_logger("supervisor_manager_node"),
-          "Invalid value for natural_language_planning: '%s'. Using default false.",
+          "Invalid value for %s: '%s'. Ignoring command-line override.",
+          key.c_str(),
           argv[i + 2]);
       } else {
         found = true;
@@ -2221,16 +4438,31 @@ bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
     }
   }
 
-  return found ? value : false;
+  if (!found) {
+    return std::nullopt;
+  }
+
+  return value;
+}
+
+bool getNaturalLanguagePlanningFromArgv(int argc, char ** argv)
+{
+  const std::optional<bool> value =
+    getBooleanArgFromArgv(argc, argv, "natural_language_planning");
+  return value.value_or(false);
 }
 }  // namespace
 
 int main(int argc, char ** argv)
 {
   const bool natural_language_planning = getNaturalLanguagePlanningFromArgv(argc, argv);
+  const std::optional<bool> ask_data_confirmation_override =
+    getBooleanArgFromArgv(argc, argv, "ask_data_confirmation_enabled");
   rclcpp::init(argc, argv);
 
-  auto node = std::make_shared<SupervisorManagerNode>(natural_language_planning);
+  auto node = std::make_shared<SupervisorManagerNode>(
+    natural_language_planning,
+    ask_data_confirmation_override);
 
   rclcpp::executors::MultiThreadedExecutor exec(
     rclcpp::ExecutorOptions(),
