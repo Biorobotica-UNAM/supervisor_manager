@@ -3214,31 +3214,31 @@ private:
         "[TakePnpRecovery] Approach completed; finding object '%s'",
         take_pnp_recovery_argument_.c_str());
 
-      take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_ALIGN;
-      return dispatchOverrideInstruction(
-        "Justina align table");
-    }
-
-    // WAIT_ALING: wait for align result, then dispatch take.
-    if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_ALIGN) {
-      if (normalizeText(feedback.action) != "align" ||
-          normalizeText(feedback.argument) != "table") {
-        return false;
-      }
-
-      if (!isSuccessfulFeedback(feedback)) {
-        return handleTakePnpRecoveryStepFailure("align");
-      }
-
-      RCLCPP_INFO(
-        this->get_logger(),
-        "[TakePnpRecovery] Align completed; finding object '%s'",
-        take_pnp_recovery_argument_.c_str());
-
       take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_FIND_OBJECT;
       return dispatchOverrideInstruction(
         "Justina find_object " + take_pnp_recovery_argument_);
     }
+
+    // WAIT_ALING: wait for align result, then dispatch take.
+    // if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_ALIGN) {
+    //   if (normalizeText(feedback.action) != "align" ||
+    //       normalizeText(feedback.argument) != "table") {
+    //     return false;
+    //   }
+
+    //   if (!isSuccessfulFeedback(feedback)) {
+    //     return handleTakePnpRecoveryStepFailure("align");
+    //   }
+
+    //   RCLCPP_INFO(
+    //     this->get_logger(),
+    //     "[TakePnpRecovery] Align completed; finding object '%s'",
+    //     take_pnp_recovery_argument_.c_str());
+
+    //   take_pnp_recovery_state_ = TakePnpRecoveryState::WAIT_FIND_OBJECT;
+    //   return dispatchOverrideInstruction(
+    //     "Justina find_object " + take_pnp_recovery_argument_);
+    // }
 
     // WAIT_FIND_OBJECT: wait for find_object result, then dispatch take.
     if (take_pnp_recovery_state_ == TakePnpRecoveryState::WAIT_FIND_OBJECT) {
@@ -4322,7 +4322,7 @@ private:
   // Recuperacion PNP: ante cualquier fallo de take, ejecuta approach +
   // find_object + take hasta MAX_TAKE_PNP_RECOVERY_ATTEMPTS veces; si se
   // agota, el objeto se ignora y el plan continua.
-  static constexpr int MAX_TAKE_PNP_RECOVERY_ATTEMPTS = 2;
+  static constexpr int MAX_TAKE_PNP_RECOVERY_ATTEMPTS = 3;
   TakePnpRecoveryState take_pnp_recovery_state_{TakePnpRecoveryState::IDLE};
   std::string take_pnp_recovery_argument_;
   int take_pnp_recovery_count_{0};
