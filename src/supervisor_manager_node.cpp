@@ -3582,7 +3582,7 @@ private:
     if (!feedback.argument.empty()) {
       spoken += " " + makeSpeechFriendly(feedback.argument);
     }
-    spoken += " failed: " + failureReasonForSpeech(feedback, reason) + ".";
+    spoken += " failed: " + failureReasonForSpeech(feedback, reason);
 
     // Si supervisor_plan ya reporto que no quedan instrucciones, no prometemos
     // un siguiente paso ni disparamos otro ciclo de ejecucion.
@@ -3610,6 +3610,44 @@ private:
       this->get_logger(),
       "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> skip failed step and allow next plan dispatch");
     publishAllowNextCycle();
+  }
+
+  void announceFailureAndAbort(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback,
+    const std::string & reason)
+  {
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "SM_WAIT_EXECUTION_RESULT: CRITICAL action failure. Aborting plan. action='%s' arg='%s' status=%s approved=%s reason='%s' worker='%s'",
+      feedback.action.c_str(),
+      feedback.argument.c_str(),
+      executionStatusName(feedback.status).c_str(),
+      feedback.approved ? "true" : "false",
+      reason.c_str(),
+      feedback.worker_result.c_str());
+
+    // 1. Mensaje hablado claro para el usuario y los jueces
+    std::string spoken = makeSpeechFriendly(feedback.action);
+    if (!feedback.argument.empty()) {
+      spoken += " " + makeSpeechFriendly(feedback.argument);
+    }
+    spoken += " failed: " + failureReasonForSpeech(feedback, reason) + " Critical failure, plan aborted.";
+
+    if (!sayText(spoken)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "SM_WAIT_EXECUTION_RESULT: could not announce failure through TTS");
+    }
+
+    // 2. Transicionar al estado final del supervisor
+    state_ = State::SM_FINISH;
+
+    // 3. CRÍTICO: 
+    // NO llamamos a publishAllowNextCycle() para evitar que el manager
+    // pida otra instrucción o dispare otro ciclo de ejecución.
+    RCLCPP_WARN(
+      this->get_logger(),
+      "SM_WAIT_EXECUTION_RESULT: Plan aborted. Pipeline stopped.");
   }
 
   std::string getCorrectiveInstruction(
@@ -3982,7 +4020,7 @@ private:
               "SM_WAIT_EXECUTION_RESULT: go_to '%s' references an unknown location; skipping retry. worker='%s'",
               feedback.argument.c_str(),
               feedback.worker_result.c_str());
-            announceFailureAndContinue(feedback, "navigation_failed - location not found");
+            announceFailureAndAbort(feedback, "navigation_failed - location not found");
             break;
           }
 
