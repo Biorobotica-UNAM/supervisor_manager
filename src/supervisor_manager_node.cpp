@@ -14,6 +14,8 @@
 #include <planning_tools/Planning.hpp>
 
 #include "supervisor_manager/pnp_recovery.hpp"
+#include "supervisor_manager/navigation_recovery.hpp"
+#include <clips_interfaces/srv/string.hpp>
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nlohmann/json.hpp>
@@ -101,6 +103,12 @@ public:
       pnp_retry_min_remaining_sec_,
       pnp_safety_margin_sec_);
 
+    this->declare_parameter<std::string>("navigation_recovery_config",
+      ament_index_cpp::get_package_share_directory("supervisor_manager") +
+      "/config/navigation_recovery.yaml");
+    navigation_recovery_ = std::make_unique<supervisor_manager::NavigationRecovery>(
+      this->get_parameter("navigation_recovery_config").as_string());
+
     // --- Entradas ROS ---
     // /system/status indica si los modulos minimos estan disponibles.
     sub_status_ = this->create_subscription<supervisor_interfaces::msg::SystemStatus>(
@@ -140,27 +148,15 @@ public:
     );
 
     // --- Salidas ROS ---
-    // Rewind permite pedirle a supervisor_plan que repita la instruccion anterior.
-	rewind_pub_ = create_publisher<std_msgs::msg::Empty>("/supervisor/supervisor_plan/rewind_one", 10);
-
-    // Semaforos de un solo disparo: uno habilita al plan a entregar una
-    // instruccion y el otro dispara la ejecucion.
+    // El manager prepara el plan por servicio y libera la ejecucion por pulso.
     allow_next_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
       "/supervisor/supervisor_manager/allow_next_instruction", 10);
-    allow_plan_instruction_pub_ = this->create_publisher<std_msgs::msg::Empty>(
-      "/supervisor/supervisor_manager/allow_plan_instruction", 10);
-
-    // Comandos auxiliares para supervisor_plan: por ahora 1 significa retry.
-    instruction_cmd_pub_ = this->create_publisher<std_msgs::msg::Int32>(
-      "/supervisor/supervisor_manager/instruction_command", 10);
-
-    // Inyeccion de una instruccion correctiva, por ejemplo pedir repetir un dato.
-	corrective_instruction_pub_ = this->create_publisher<std_msgs::msg::String>(
-	  "/supervisor/supervisor_manager/instruction", 10);
-
     // Clientes usados por el pipeline opcional de lenguaje natural y por los
     // mensajes hablados de error.
     hri_client_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    prepare_cycle_client_ = this->create_client<clips_interfaces::srv::String>(
+      "/supervisor/supervisor_plan/prepare_cycle",
+      rmw_qos_profile_services_default, hri_client_group_);
     talker_client_ = this->create_client<talker_interfaces::srv::Talk>(
       "/hri/talker/talk",
       rmw_qos_profile_services_default,
@@ -719,7 +715,12 @@ private:
             continue;
           }
 
-          addKnownLocationToken(item.as<std::string>());
+          const auto canonical = normalizeKnowledgeToken(item.as<std::string>());
+          addKnownLocationToken(canonical);
+          known_location_aliases_[canonical] = canonical;
+          std::string compact = canonical;
+          compact.erase(std::remove(compact.begin(), compact.end(), '_'), compact.end());
+          known_location_aliases_[compact] = canonical;
         }
       }
 
@@ -918,15 +919,17 @@ private:
   {
     RCLCPP_INFO(this->get_logger(), "[Pipeline][Step 3] Converting to CLIPS: \"%s\"", semantic.c_str());
     const bool use_goals_to_clips = semanticHasGoalsPayload(semantic);
-    const std::string clips = use_goals_to_clips
-      ? planning_->goalsToClips(semantic)
-      : planning_->primitiveToClips(semantic);
+    if (!use_goals_to_clips) {
+      RCLCPP_ERROR(get_logger(), "Expected goals JSON; legacy primitiveToClips API was removed");
+      return "";
+    }
+    const std::string clips = planning_->goalsToClips(semantic);
 
     if (clips.empty() || clips.rfind("ERROR", 0U) == 0U) {
       RCLCPP_ERROR(
         this->get_logger(),
         "[Pipeline][Step 3] %s failed: \"%s\"",
-        use_goals_to_clips ? "goalsToClips" : "primitiveToClips",
+        "goalsToClips",
         clips.c_str());
       return "";
     }
@@ -934,7 +937,7 @@ private:
     RCLCPP_INFO(
       this->get_logger(),
       "[Pipeline][Step 3] %s response: \"%s\"",
-      use_goals_to_clips ? "goalsToClips" : "primitiveToClips",
+      "goalsToClips",
       clips.c_str());
     return clips;
   }
@@ -1192,7 +1195,7 @@ private:
   bool consumeExecutionFeedback(supervisor_interfaces::msg::TaskExecutionReport & out)
   {
     std::lock_guard<std::mutex> lock(mtx_);
-    if (!got_execution_feedback_ || !last_execution_feedback_.has_value()) {
+    if (!got_plan_active_ || !got_execution_feedback_ || !last_execution_feedback_.has_value()) {
       return false;
     }
     out = *last_execution_feedback_;
@@ -1203,55 +1206,67 @@ private:
 
   bool publishAllowNextCycle()
   {
-    // Evita perder el semaforo de un solo disparo si algun nodo aun no descubre
-    // sus subscribers; en ese caso el FSM permanece en el estado actual y reintenta.
-    const size_t plan_subscribers =
-      allow_plan_instruction_pub_->get_subscription_count();
-    const size_t execution_subscribers =
-      allow_next_instruction_pub_->get_subscription_count();
-
-    if (plan_subscribers == 0 || execution_subscribers == 0)
-    {
-      RCLCPP_WARN_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "Manager semaphore not sent: waiting subscribers "
-        "allow_plan_instruction=%zu allow_next_instruction=%zu",
-        plan_subscribers,
-        execution_subscribers);
-      return false;
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(mtx_);
-      got_plan_active_ = false;
-    }
-
-    // Give supervisor_plan its dispatch token before triggering executor_manager
-    // to request the next instruction. Publishing both topics back-to-back can
-    // race: execution may call /request_instruction before the plan node has
-    // processed allow_plan_instruction.
-    allow_plan_instruction_pub_->publish(std_msgs::msg::Empty{});
-    scheduleExecutionTrigger();
+    // Accept the decision now. tick retries delivery until dependencies exist.
+    cycle_pending_ = true;
     return true;
   }
 
-  void scheduleExecutionTrigger()
+  bool processPendingCycle()
   {
-    if (execution_trigger_timer_) {
-      execution_trigger_timer_->cancel();
-      execution_trigger_timer_.reset();
+    if (!cycle_pending_) {return false;}
+    if (execution_release_pending_) {
+      if (allow_next_instruction_pub_->get_subscription_count() == 0) {return true;}
+      allow_next_instruction_pub_->publish(std_msgs::msg::Empty{});
+      execution_release_pending_ = false;
+      cycle_pending_ = false;
+      pending_plan_operations_ = nlohmann::json::array();
+      return true;
     }
-
-    execution_trigger_timer_ = this->create_wall_timer(
-      50ms,
-      [this]()
+    if (!prepare_cycle_future_) {
+      if (!prepare_cycle_client_->service_is_ready() ||
+          allow_next_instruction_pub_->get_subscription_count() == 0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Pending dispatch: waiting for plan prepare service and execution subscriber");
+        return true;
+      }
+      auto request = std::make_shared<clips_interfaces::srv::String::Request>();
+      request->data = pending_plan_operations_.dump();
       {
-        allow_next_instruction_pub_->publish(std_msgs::msg::Empty{});
-        if (execution_trigger_timer_) {
-          execution_trigger_timer_->cancel();
-          execution_trigger_timer_.reset();
-        }
-      });
+        std::lock_guard<std::mutex> lock(mtx_);
+        got_plan_active_ = false;
+      }
+      prepare_cycle_future_ = prepare_cycle_client_->async_send_request(request).share();
+      prepare_cycle_deadline_ = std::chrono::steady_clock::now() + 10s;
+      return true;
+    }
+    if (prepare_cycle_future_->wait_for(0s) != std::future_status::ready) {
+      if (std::chrono::steady_clock::now() >= prepare_cycle_deadline_) {
+        // Do not resend mutations after an ambiguous timeout (skip/rewind).
+        prepare_cycle_client_->prune_pending_requests();
+        prepare_cycle_future_.reset();
+        cycle_pending_ = false;
+        RCLCPP_ERROR(get_logger(), "Plan preparation timed out; stopping task");
+        state_ = State::SM_FINISH;
+      }
+      return true;
+    }
+    const auto response = prepare_cycle_future_->get();
+    prepare_cycle_future_.reset();
+    if (response->data != "ready") {
+      RCLCPP_ERROR(get_logger(), "Plan rejected cycle: %s", response->data.c_str());
+      cycle_pending_ = false;
+      state_ = State::SM_FINISH;
+      return true;
+    }
+    // The plan has applied all mutations and installed its token.
+    if (allow_next_instruction_pub_->get_subscription_count() == 0) {
+      execution_release_pending_ = true;
+      return true;
+    }
+    allow_next_instruction_pub_->publish(std_msgs::msg::Empty{});
+    pending_plan_operations_ = nlohmann::json::array();
+    cycle_pending_ = false;
+    return true;
   }
 
   bool getPlanActiveStatus(bool & out)
@@ -1291,7 +1306,7 @@ private:
     // supervisor_plan interpreta command=1 como "reenviar la ultima instruccion".
     std_msgs::msg::Int32 msg;
     msg.data = 1;
-    instruction_cmd_pub_->publish(msg);
+    pending_plan_operations_.push_back({{"command", msg.data}});
   }
 
   void publishSkipCommand(int count)
@@ -1304,7 +1319,7 @@ private:
     // normales" antes de entregar la siguiente instruccion ejecutable.
     std_msgs::msg::Int32 msg;
     msg.data = -count;
-    instruction_cmd_pub_->publish(msg);
+    pending_plan_operations_.push_back({{"command", msg.data}});
   }
 
   void publishOverrideInstruction(const std::string & instruction)
@@ -1313,7 +1328,7 @@ private:
     // ejecuta antes del siguiente paso normal del plan.
     std_msgs::msg::String inj;
     inj.data = instruction;
-    corrective_instruction_pub_->publish(inj);
+    pending_plan_operations_.push_back({{"override", inj.data}});
   }
 
   bool dispatchOverrideInstruction(const std::string & instruction)
@@ -1376,6 +1391,7 @@ private:
   bool handlePnpFeedback(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback)
   {
+    if (natural_language_planning_) {return false;}
     supervisor_manager::PnpFeedback pnp_feedback;
     pnp_feedback.action = feedback.action;
     pnp_feedback.argument = feedback.argument;
@@ -2190,7 +2206,7 @@ private:
   {
     // Repite la pareja ask/listen usando las herramientas ya existentes:
     // 1) rewind_one hace que supervisor_plan repita el listen actual,
-    // 2) corrective_instruction_pub_ inyecta antes el "Justina say ask_*".
+    // 2) La transaccion del plan inyecta antes el "Justina say ask_*".
     if (pending_confirmation_ask_key_.empty()) {
       return false;
     }
@@ -2202,11 +2218,11 @@ private:
       confirmation_attempts_ + 1,
       MAX_CONFIRMATION_ATTEMPTS);
 
-    rewind_pub_->publish(std_msgs::msg::Empty{});
+    pending_plan_operations_.push_back({{"rewind", true}});
 
     std_msgs::msg::String inj;
     inj.data = "Justina say " + pending_confirmation_ask_key_;
-    corrective_instruction_pub_->publish(inj);
+    pending_plan_operations_.push_back({{"override", inj.data}});
 
     publishAllowNextCycle();
     return true;
@@ -2412,6 +2428,7 @@ private:
   bool isNavigationLocationNotFoundFailure(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback) const
   {
+    if (normalizeText(feedback.failure_reason) == "location_not_found") {return true;}
     if (!isNavigationFailure(feedback)) {
       return false;
     }
@@ -2457,7 +2474,9 @@ private:
     const std::string action = normalizeText(feedback.action);
     const std::string worker = normalizeText(feedback.worker_result);
     return action == "find_object" &&
-           worker.rfind("object_not_found:", 0U) == 0U;
+           (normalizeText(feedback.failure_reason) == "object_not_found" ||
+             worker.rfind("object_not_found:", 0U) == 0U ||
+             (worker.size() >= 10 && worker.compare(worker.size() - 10, 10, "_not_found") == 0));
   }
 
   void resetFindPersonAnybodyRetryState()
@@ -3171,7 +3190,8 @@ private:
 
     // IDLE: detect a new take failure and start the recovery sequence.
     if (take_pnp_recovery_state_ == TakePnpRecoveryState::IDLE) {
-      if (!isTakeAction(feedback) ||
+      if (!pnp_recovery_.isManagedObject(feedback.argument) ||
+          natural_language_planning_ || !isTakeAction(feedback) ||
           feedback.approved ||
           !isExecutionFailureStatus(feedback.status) ||
           isTakeIgnored(feedback.argument))
@@ -3618,7 +3638,7 @@ private:
   {
     // Instrucciones correctivas para fallos de escucha. El objetivo es decir
     // algo antes de repetir la instruccion original.
-    if (action == "listen") {
+    if (normalizeText(action) == "listen") {
       const std::string attribute = listenAttributeFromArgument(argument);
       if (attribute == "name")     return "Justina say repeat_name";
       if (attribute == "drink")    return "Justina say repeat_drink";
@@ -3628,9 +3648,117 @@ private:
     return "";
   }
 
+  bool handleNavigationFeedback(
+    const supervisor_interfaces::msg::TaskExecutionReport & feedback)
+  {
+    const auto action = normalizeText(feedback.action);
+    if (action != "go_to" && action != "goto") {return false;}
+    std::string error = normalizeText(feedback.failure_reason);
+    if (isSuccessfulGoTo(feedback)) {
+      const auto arrival = verifySuccessfulGoToArrival(feedback);
+      if (!arrival.verified || arrival.within_tolerance) {
+        navigation_recovery_->reset();
+        return false;
+      }
+      error = "arrival_outside_tolerance";
+    } else if (isBumperFailure(feedback)) {
+      error = "bumper_triggered";
+    } else if (isNavigationLocationNotFoundFailure(feedback)) {
+      error = "location_not_found";
+    } else if (error == "timeout") {
+      error = "navigation_failed";
+    }
+    const auto decision = navigation_recovery_->handle(error, feedback.argument);
+    if (decision.behavior == supervisor_manager::NavigationRecovery::Behavior::NONE) {
+      return false;
+    }
+    navigation_error_ = error;
+    navigation_argument_ = feedback.argument;
+    navigation_decision_ = decision;
+    navigation_prompt_ = decision.phrase;
+    navigation_io_state_ = NavigationIoState::START_SPEAK;
+    return true;
+  }
+
+  bool tickNavigationRecovery()
+  {
+    using Behavior = supervisor_manager::NavigationRecovery::Behavior;
+    if (navigation_io_state_ == NavigationIoState::IDLE) {return false;}
+    const auto now = std::chrono::steady_clock::now();
+    if (navigation_io_state_ == NavigationIoState::START_SPEAK) {
+      navigation_deadline_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(navigation_recovery_->serviceTimeoutSec()));
+      if (talker_client_->service_is_ready()) {
+        auto req = std::make_shared<talker_interfaces::srv::Talk::Request>();
+        req->text = navigation_prompt_;
+        navigation_talk_future_ = talker_client_->async_send_request(req).share();
+      }
+      navigation_io_state_ = NavigationIoState::WAIT_SPEAK;
+      return true;
+    }
+    if (navigation_io_state_ == NavigationIoState::WAIT_SPEAK) {
+      const bool ready = navigation_talk_future_ &&
+        navigation_talk_future_->wait_for(0s) == std::future_status::ready;
+      if (!ready && now < navigation_deadline_) {return true;}
+      if (ready) {navigation_talk_future_->get();}
+      else {talker_client_->prune_pending_requests();}
+      navigation_talk_future_.reset();
+      if (navigation_decision_.behavior == Behavior::ABORT) {
+        navigation_io_state_ = NavigationIoState::IDLE;
+        state_ = State::SM_FINISH;
+      } else if (navigation_decision_.behavior == Behavior::RETRY) {
+        navigation_io_state_ = NavigationIoState::IDLE;
+        publishRetryCommand();
+        publishAllowNextCycle();
+      } else {
+        navigation_io_state_ = NavigationIoState::START_LISTEN;
+      }
+      return true;
+    }
+    if (navigation_io_state_ == NavigationIoState::START_LISTEN) {
+      navigation_deadline_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(navigation_recovery_->serviceTimeoutSec()));
+      if (listener_client_->service_is_ready()) {
+        auto req = std::make_shared<listener_interfaces::srv::Listen::Request>();
+        req->enable = true;
+        req->grammar = "";
+        navigation_listen_future_ = listener_client_->async_send_request(req).share();
+      }
+      navigation_io_state_ = NavigationIoState::WAIT_LISTEN;
+      return true;
+    }
+    const bool ready = navigation_listen_future_ &&
+      navigation_listen_future_->wait_for(0s) == std::future_status::ready;
+    if (!ready && now < navigation_deadline_) {return true;}
+    std::string destination;
+    if (ready) {
+      const auto response = navigation_listen_future_->get();
+      if (response->success) {destination = normalizeKnowledgeToken(response->recognized_speech);}
+    } else {listener_client_->prune_pending_requests();}
+    navigation_listen_future_.reset();
+    // Accept only a canonical known location, never free text as an instruction.
+    if (!destination.empty() && loadKnownLocations() && known_location_aliases_.count(destination)) {
+      destination = known_location_aliases_.at(destination);
+      navigation_argument_ = destination;
+      navigation_io_state_ = NavigationIoState::IDLE;
+      // Override becomes supervisor_plan's last instruction, so subsequent
+      // retries use the corrected destination without rewinding the plan.
+      dispatchOverrideInstruction("Justina go_to " + destination);
+    } else {
+      navigation_decision_ = navigation_recovery_->handle(navigation_error_, navigation_argument_);
+      navigation_prompt_ = navigation_decision_.behavior == Behavior::ABORT ?
+        navigation_decision_.phrase : navigation_decision_.invalid_phrase;
+      if (navigation_prompt_.empty()) {navigation_prompt_ = navigation_decision_.phrase;}
+      navigation_io_state_ = NavigationIoState::START_SPEAK;
+    }
+    return true;
+  }
+
   // ===== FSM Tick =====
   void tick()
   {
+    if (processPendingCycle()) {return;}
+    if (tickNavigationRecovery()) {return;}
     switch (state_)
     {
       case State::SM_INIT:
@@ -3740,6 +3868,7 @@ private:
           "SM_WAIT_PLAN_READY: supervisor_plan confirmed plan is ready"
         );
         pnp_recovery_.reset(this->now());
+        navigation_recovery_->reset();
         state_ = State::SM_POST_PLAN_TRIGGER;
         break;
       }
@@ -3750,8 +3879,8 @@ private:
                     "SM_POST_PLAN_TRIGGER: plan ready.");
         RCLCPP_INFO(this->get_logger(),
                     "SM_POST_PLAN_TRIGGER: Manager semaphore -> allow one plan dispatch + allow execution trigger");
-        // Si todavia no hay subscribers para el semaforo, no avanzamos a esperar
-        // feedback de ejecucion porque nadie habria recibido la orden inicial.
+        // La decision queda pendiente; processPendingCycle espera dependencias
+        // y confirmacion del plan antes de liberar la ejecucion.
         if (!publishAllowNextCycle()) {
           break;
         }
@@ -3805,6 +3934,13 @@ private:
           feedback.failure_reason.c_str()
         );
 
+        if (feedback.failure_reason == "physical_effect_uncertain") {
+          RCLCPP_ERROR(get_logger(), "Uncertain physical effect: %s", feedback.worker_result.c_str());
+          state_ = State::SM_FINISH;
+          break;
+        }
+        if (handleNavigationFeedback(feedback)) {break;}
+
         if (feedback.action != "listen") {
 			corrective_pending_ = false;
 		}
@@ -3853,6 +3989,43 @@ private:
         {
           break;
         }
+
+        // En el bloque de retry:
+		if (needsApprovalRetry(feedback.action) && !feedback.approved &&
+            normalizeText(feedback.action) == "listen" &&
+            pending_confirmation_ask_key_.empty())
+		{
+		  // For confirmation listens, only an explicit "no" phrase should trigger
+		  // a retry. Silence, unclear speech, or any non-negative response means
+		  // the user accepted, so proceed to the next instruction.
+		  if (normalizeText(feedback.action) == "listen" &&
+              normalizeText(feedback.argument) == "confirm" &&
+              !isNoAnswer(feedback.worker_result))
+          {
+            RCLCPP_INFO(
+              this->get_logger(),
+              "[Confirmation] listen confirm: non-negative response '%s'; treating as acceptance",
+              feedback.worker_result.c_str());
+            publishAllowNextCycle();
+            break;
+          }
+
+		  if (!corrective_pending_) {
+			  const std::string corrective =
+				getCorrectiveInstruction(feedback.action, feedback.argument);
+			  if (!corrective.empty()) {
+				// Rewind para que el listen se reintente después del say
+				pending_plan_operations_.push_back({{"rewind", true}});
+
+				std_msgs::msg::String inj;
+				inj.data = corrective;
+				pending_plan_operations_.push_back({{"override", inj.data}});
+				corrective_pending_ = true;
+			  }
+			}
+			publishAllowNextCycle();
+			break;
+		}
 
         if (!feedback.approved || isExecutionFailureStatus(feedback.status))
         {
@@ -3972,35 +4145,6 @@ private:
             break;
           }
 
-          // Navigation failures retry indefinitely until goal is reached.
-          // The only accepted stop is a bumper trigger.
-          if (isNavigationLocationNotFoundFailure(feedback))
-          {
-            nav_retry_count_ = 0;
-            RCLCPP_WARN(
-              this->get_logger(),
-              "SM_WAIT_EXECUTION_RESULT: go_to '%s' references an unknown location; skipping retry. worker='%s'",
-              feedback.argument.c_str(),
-              feedback.worker_result.c_str());
-            announceFailureAndContinue(feedback, "navigation_failed - location not found");
-            break;
-          }
-
-          if (isNavigationFailure(feedback) && !isBumperFailure(feedback))
-          {
-            ++nav_retry_count_;
-            RCLCPP_WARN(
-              this->get_logger(),
-              "SM_WAIT_EXECUTION_RESULT: navigation failed (retry #%d) for go_to '%s'. reason='%s' worker='%s' - retrying.",
-              nav_retry_count_,
-              feedback.argument.c_str(),
-              feedback.failure_reason.c_str(),
-              feedback.worker_result.c_str());
-            publishRetryCommand();
-            publishAllowNextCycle();
-            break;
-          }
-
           if (handleTakeFailureRetry(feedback)) {
             break;
           }
@@ -4029,41 +4173,6 @@ private:
           break;
         }
 
-        // En el bloque de retry:
-		if (needsApprovalRetry(feedback.action) && !feedback.approved)
-		{
-		  // For confirmation listens, only an explicit "no" phrase should trigger
-		  // a retry. Silence, unclear speech, or any non-negative response means
-		  // the user accepted, so proceed to the next instruction.
-		  if (normalizeText(feedback.action) == "listen" &&
-              normalizeText(feedback.argument) == "confirm" &&
-              !isNoAnswer(feedback.worker_result))
-          {
-            RCLCPP_INFO(
-              this->get_logger(),
-              "[Confirmation] listen confirm: non-negative response '%s'; treating as acceptance",
-              feedback.worker_result.c_str());
-            publishAllowNextCycle();
-            break;
-          }
-
-		  if (!corrective_pending_) {
-			  const std::string corrective =
-				getCorrectiveInstruction(feedback.action, feedback.argument);
-			  if (!corrective.empty()) {
-				// Rewind para que el listen se reintente después del say
-				rewind_pub_->publish(std_msgs::msg::Empty{});
-
-				std_msgs::msg::String inj;
-				inj.data = corrective;
-				corrective_instruction_pub_->publish(inj);
-				corrective_pending_ = true;
-			  }
-			}
-			publishAllowNextCycle();
-			break;
-		}
-
         if (feedback.status == supervisor_interfaces::msg::TaskExecutionReport::SUCCESS)
         {
           if (normalizeText(feedback.action) == "find_person") {
@@ -4085,23 +4194,6 @@ private:
           }
 
           const GoToArrivalVerification go_to_arrival = verifySuccessfulGoToArrival(feedback);
-          if (go_to_arrival.applicable && go_to_arrival.verified &&
-              !go_to_arrival.within_tolerance)
-          {
-            ++nav_retry_count_;
-            RCLCPP_WARN(
-              this->get_logger(),
-              "SM_WAIT_EXECUTION_RESULT: go_to '%s' reported success but robot is still %.2f m away from TF '%s' (tolerance %.2f m). Retrying navigation (#%d).",
-              feedback.argument.c_str(),
-              go_to_arrival.distance_m,
-              go_to_arrival.goal_frame.c_str(),
-              go_to_success_distance_tolerance_m_,
-              nav_retry_count_);
-            publishRetryCommand();
-            publishAllowNextCycle();
-            break;
-          }
-
           if (go_to_arrival.applicable && !go_to_arrival.verified) {
             RCLCPP_WARN(
               this->get_logger(),
@@ -4216,6 +4308,19 @@ private:
     }
   }
 
+  enum class NavigationIoState {IDLE, START_SPEAK, WAIT_SPEAK, START_LISTEN, WAIT_LISTEN};
+  NavigationIoState navigation_io_state_{NavigationIoState::IDLE};
+  std::unique_ptr<supervisor_manager::NavigationRecovery> navigation_recovery_;
+  supervisor_manager::NavigationRecovery::Decision navigation_decision_;
+  std::string navigation_error_, navigation_argument_, navigation_prompt_;
+  std::chrono::steady_clock::time_point navigation_deadline_, prepare_cycle_deadline_;
+  std::optional<rclcpp::Client<talker_interfaces::srv::Talk>::SharedFuture> navigation_talk_future_;
+  std::optional<rclcpp::Client<listener_interfaces::srv::Listen>::SharedFuture> navigation_listen_future_;
+  rclcpp::Client<clips_interfaces::srv::String>::SharedPtr prepare_cycle_client_;
+  std::optional<rclcpp::Client<clips_interfaces::srv::String>::SharedFuture> prepare_cycle_future_;
+  bool cycle_pending_{false}, execution_release_pending_{false};
+  nlohmann::json pending_plan_operations_ = nlohmann::json::array();
+
   // ===== ROS =====
   rclcpp::Subscription<supervisor_interfaces::msg::SystemStatus>::SharedPtr sub_status_;
   rclcpp::Subscription<supervisor_interfaces::msg::TaskExecutionReport>::SharedPtr
@@ -4224,11 +4329,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr plan_ready_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr current_instruction_sub_;
 
-  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr rewind_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_next_instruction_pub_;
-  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr allow_plan_instruction_pub_;
-  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr instruction_cmd_pub_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr corrective_instruction_pub_;
   rclcpp::CallbackGroup::SharedPtr hri_client_group_;
   rclcpp::Client<known_locations_interfaces::srv::LocationsGet>::SharedPtr goto_client_;
   rclcpp::Client<head_interfaces::srv::MoveHead>::SharedPtr head_client_;
@@ -4239,7 +4340,6 @@ private:
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
-  rclcpp::TimerBase::SharedPtr execution_trigger_timer_;
 
   // Tools
   // Fachada hacia planning_tools: startPlanning, semantic parser y primitive_to_clips.
@@ -4260,6 +4360,7 @@ private:
   bool at_instruction_point_{false};
   bool known_locations_loaded_{false};
   std::unordered_set<std::string> known_locations_;
+  std::map<std::string, std::string> known_location_aliases_;
 
   // FSM
   State state_{State::SM_INIT};

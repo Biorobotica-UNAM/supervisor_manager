@@ -1,0 +1,22 @@
+# Edit phrases and limits here; restart the manager to reload.
+# Supported behaviors: ask_location, retry, abort. Exhaustion always aborts.
+cases:
+  location_not_found:
+    behavior: ask_location
+    max_attempts: 2
+    phrase: "I do not know the location {argument}. Please tell me another location."
+    invalid_phrase: "That is not a known location. Please tell me another location."
+  navigation_failed:
+    behavior: retry
+    max_attempts: 3
+    phrase: "I could not reach {argument}. I will try again."
+  arrival_outside_tolerance:
+    behavior: retry
+    max_attempts: 2
+    phrase: "I am still far from {argument}. I will try again."
+  bumper_triggered:
+    behavior: abort
+    max_attempts: 0
+    phrase: "Navigation stopped because the bumper was triggered."
+exhausted_phrase: "I could not recover navigation. I will stop this task."
+service_timeout_sec: 15.0

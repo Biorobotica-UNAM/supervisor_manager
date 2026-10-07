@@ -34,6 +34,13 @@ if(BUILD_TESTING)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 
+  ament_add_gtest(test_navigation_recovery
+    test/test_navigation_recovery.cpp src/navigation_recovery.cpp)
+  target_include_directories(test_navigation_recovery PRIVATE include)
+  target_compile_definitions(test_navigation_recovery PRIVATE
+    NAVIGATION_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/config/navigation_recovery.yaml")
+  target_link_libraries(test_navigation_recovery yaml-cpp)
+
   ament_add_gtest(test_pnp_recovery
     test/test_pnp_recovery.cpp
     src/pnp_recovery.cpp
@@ -49,6 +56,7 @@ endif()
 add_executable(supervisor_manager_node
   src/supervisor_manager_node.cpp
   src/pnp_recovery.cpp
+  src/navigation_recovery.cpp
 )
 
 target_include_directories(supervisor_manager_node PUBLIC
@@ -83,7 +91,7 @@ install(TARGETS
 )
 
 install(
-  DIRECTORY launch
+  DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}
 )
 
