@@ -29,6 +29,7 @@ def executable(package, name):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exhausted', action='store_true')
+    parser.add_argument('--continue-on-failure', action='store_true')
     args = parser.parse_args()
     rclpy.init()
     node = Node('navigation_pilot_fixture')
@@ -76,7 +77,8 @@ def main():
     handles = [open(Path(logs) / name, 'w') for name in ['plan.log', 'manager.log']]
     processes = [subprocess.Popen([executable('supervisor_plan', 'supervisor_plan_node'), '--ros-args',
                      '-r', '/supervisor/supervisor_plan/active:=/fixture/plan_active'], stdout=handles[0], stderr=subprocess.STDOUT),
-                 subprocess.Popen([executable('supervisor_manager', 'supervisor_manager_node')], stdout=handles[1], stderr=subprocess.STDOUT)]
+                 subprocess.Popen([executable('supervisor_manager', 'supervisor_manager_node'), '--ros-args',
+                     '-p', 'continue_on_recovery_failure:=' + str(args.continue_on_failure).lower()], stdout=handles[1], stderr=subprocess.STDOUT)]
     started = time.monotonic()
     try:
         while time.monotonic() - started < 35:
@@ -123,7 +125,19 @@ def main():
             if processes[1].poll() is not None:
                 break
         assert processes[1].poll() == 0, f'manager did not finish; logs: {logs}'
+        manager_log = (Path(logs) / 'manager.log').read_text()
+        assert '[NavigationRecovery] BEGIN' in manager_log, manager_log
+        assert 'state=START_SPEAK -> WAIT_SPEAK' in manager_log, manager_log
+        assert 'auxiliary LISTEN known_location' in manager_log, manager_log
+        if args.exhausted and args.continue_on_failure:
+            assert instructions == ['Justina go_to missing', 'Justina say done'], instructions
+            assert '[RecoveryOutcome] CONTINUE' in manager_log, manager_log
+            assert any('continue with the plan' in phrase for phrase in phrases), phrases
+            print('PASS: debug continuation skips failed navigation after exhausted recovery')
+            print(f'Logs: {logs}')
+            return
         if args.exhausted:
+            assert '[RecoveryOutcome] STOP' in manager_log, manager_log
             assert instructions == ['Justina go_to missing'], instructions
             assert any('stop this task' in phrase for phrase in phrases), phrases
             print('PASS: exhausted location captures abort without advancing the original plan')
@@ -134,6 +148,8 @@ def main():
         assert any('another location' in phrase for phrase in phrases), phrases
         assert any('not a known location' in phrase for phrase in phrases), phrases
         assert any('try again' in phrase for phrase in phrases), phrases
+        assert "[PlanMutation] inserted instruction='Justina go_to kitchen_table'" in manager_log
+        assert '[PlanMutation] queued command=1' in manager_log
         print('PASS: corrected destination persists across retry, invalid input reprompted, late executor recovered, delayed plan status retained, next original step preserved')
         print(f'Logs: {logs}')
     finally:

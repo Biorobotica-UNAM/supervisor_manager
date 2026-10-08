@@ -224,3 +224,47 @@ paso original. Requiere sockets DDS locales disponibles.
 
 Para verificar agotamiento sin avanzar el plan, ejecuta también la prueba con
 `--exhausted`.
+
+
+## Logs de recuperación y continuación para depuración
+
+Los logs INFO muestran `[NavigationRecovery] BEGIN`, el código de error, el
+comportamiento elegido y cada transición de estado. `auxiliary SAY` y
+`auxiliary LISTEN` son llamadas directas a HRI, no instrucciones insertadas en
+el plan. `[PlanMutation]` muestra instrucciones insertadas y comandos de
+reintento/salto; `[PlanDispatch]` muestra el lote enviado y su confirmación.
+`CURRENT_INSTRUCTION` sigue mostrando lo efectivamente despachado por el plan.
+Los resultados de escucha, destinos rechazados y fallos/timeouts de voz también
+se registran.
+
+`continue_on_recovery_failure` es un parámetro ROS booleano, false por defecto:
+
+```bash
+# Depuración: tras agotar la recuperación de navegación, omitir el paso fallido.
+ros2 run supervisor_manager supervisor_manager_node --ros-args \
+  -p continue_on_recovery_failure:=true
+
+# Detener cuando la recuperación no consigue resolver el fallo.
+ros2 run supervisor_manager supervisor_manager_node --ros-args \
+  -p continue_on_recovery_failure:=false
+```
+
+También puede cambiarse con `ros2 param set` durante la ejecución; la decisión
+lee el valor actual al terminar la recuperación. Se aplica al agotamiento/aborto
+de navegación y al manejo genérico de acciones fallidas. No desactiva los
+reintentos. Con true se anuncia el fallo y se continúa solo si quedan pasos;
+con false se termina. Los casos con políticas especializadas (PNP, puerta,
+captura de datos) conservan sus decisiones propias. El bumper, los efectos
+físicos inciertos y los errores del protocolo de despacho siempre detienen la
+tarea. El archivo YAML sigue controlando frases y presupuestos; al continuar
+por depuración se sustituye el anuncio final de detenerse por uno de continuar.
+
+Pruebas integradas de ambos modos:
+
+```bash
+ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST /usr/bin/python3 \
+  src/Supervisor/supervisor_manager/test/navigation_pilot_smoke.py --exhausted
+ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST /usr/bin/python3 \
+  src/Supervisor/supervisor_manager/test/navigation_pilot_smoke.py \
+  --exhausted --continue-on-failure
+```

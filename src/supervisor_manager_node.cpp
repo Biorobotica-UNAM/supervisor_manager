@@ -61,6 +61,9 @@ public:
     this->declare_parameter<std::string>("base_frame", "base_link");
     this->declare_parameter<double>("go_to_success_distance_tolerance_m", 0.75);
     this->declare_parameter<bool>("ask_data_confirmation_enabled", false);
+    this->declare_parameter<bool>("continue_on_recovery_failure", true);
+    RCLCPP_INFO(get_logger(), "continue_on_recovery_failure=%s",
+      get_parameter("continue_on_recovery_failure").as_bool() ? "true" : "false");
     this->declare_parameter<double>("pnp_time_limit_sec", 420.0);
     this->declare_parameter<double>("pnp_retry_min_remaining_sec", 60.0);
     this->declare_parameter<double>("pnp_safety_margin_sec", 25.0);
@@ -205,6 +208,8 @@ private:
 
     SM_FINISH
   };
+
+  enum class NavigationIoState {IDLE, START_SPEAK, WAIT_SPEAK, START_LISTEN, WAIT_LISTEN};
 
   enum class FollowGiftState : uint8_t
   {
@@ -1231,6 +1236,7 @@ private:
       }
       auto request = std::make_shared<clips_interfaces::srv::String::Request>();
       request->data = pending_plan_operations_.dump();
+      RCLCPP_INFO(get_logger(), "[PlanDispatch] preparing operations=%s", request->data.c_str());
       {
         std::lock_guard<std::mutex> lock(mtx_);
         got_plan_active_ = false;
@@ -1258,6 +1264,7 @@ private:
       state_ = State::SM_FINISH;
       return true;
     }
+    RCLCPP_INFO(get_logger(), "[PlanDispatch] plan acknowledged operations; waiting execution release");
     // The plan has applied all mutations and installed its token.
     if (allow_next_instruction_pub_->get_subscription_count() == 0) {
       execution_release_pending_ = true;
@@ -1306,6 +1313,8 @@ private:
     // supervisor_plan interpreta command=1 como "reenviar la ultima instruccion".
     std_msgs::msg::Int32 msg;
     msg.data = 1;
+    RCLCPP_INFO(get_logger(), "[PlanMutation] queued command=%d current_instruction='%s'",
+      msg.data, getCurrentInstruction().c_str());
     pending_plan_operations_.push_back({{"command", msg.data}});
   }
 
@@ -1319,6 +1328,8 @@ private:
     // normales" antes de entregar la siguiente instruccion ejecutable.
     std_msgs::msg::Int32 msg;
     msg.data = -count;
+    RCLCPP_INFO(get_logger(), "[PlanMutation] queued command=%d current_instruction='%s'",
+      msg.data, getCurrentInstruction().c_str());
     pending_plan_operations_.push_back({{"command", msg.data}});
   }
 
@@ -1328,6 +1339,7 @@ private:
     // ejecuta antes del siguiente paso normal del plan.
     std_msgs::msg::String inj;
     inj.data = instruction;
+    RCLCPP_INFO(get_logger(), "[PlanMutation] inserted instruction='%s'", inj.data.c_str());
     pending_plan_operations_.push_back({{"override", inj.data}});
   }
 
@@ -2222,6 +2234,7 @@ private:
 
     std_msgs::msg::String inj;
     inj.data = "Justina say " + pending_confirmation_ask_key_;
+    RCLCPP_INFO(get_logger(), "[PlanMutation] inserted instruction='%s'", inj.data.c_str());
     pending_plan_operations_.push_back({{"override", inj.data}});
 
     publishAllowNextCycle();
@@ -3579,6 +3592,26 @@ private:
     return dispatchOverrideInstruction(find_pose_instruction);
   }
 
+  bool continueAfterRecoveryFailure() const
+  {
+    return get_parameter("continue_on_recovery_failure").as_bool();
+  }
+
+  void finishFailedStep(bool can_continue)
+  {
+    bool active = false;
+    const bool known = getPlanActiveStatus(active);
+    if (!can_continue || !known || !active) {
+      RCLCPP_WARN(get_logger(),
+        "[RecoveryOutcome] STOP can_continue=%s plan_active_known=%s plan_active=%s",
+        can_continue ? "true" : "false", known ? "true" : "false", active ? "true" : "false");
+      state_ = State::SM_FINISH;
+      return;
+    }
+    RCLCPP_WARN(get_logger(), "[RecoveryOutcome] CONTINUE: failed step skipped; resuming original plan");
+    publishAllowNextCycle();
+  }
+
   void announceFailureAndContinue(
     const supervisor_interfaces::msg::TaskExecutionReport & feedback,
     const std::string & reason)
@@ -3606,7 +3639,10 @@ private:
 
     // Si supervisor_plan ya reporto que no quedan instrucciones, no prometemos
     // un siguiente paso ni disparamos otro ciclo de ejecucion.
-    if (knows_plan_state && !active_plan) {
+    const bool can_continue = continueAfterRecoveryFailure() && !isBumperFailure(feedback);
+    if (!can_continue) {
+      spoken += " I will stop this task.";
+    } else if (knows_plan_state && !active_plan) {
       spoken += " No more steps.";
     } else {
       spoken += " Next step.";
@@ -3618,18 +3654,7 @@ private:
         "SM_WAIT_EXECUTION_RESULT: could not announce failure through TTS");
     }
 
-    if (knows_plan_state && !active_plan) {
-      RCLCPP_INFO(
-        this->get_logger(),
-        "SM_WAIT_EXECUTION_RESULT: failed on last instruction -> finish without dispatching another step");
-      state_ = State::SM_FINISH;
-      return;
-    }
-
-    RCLCPP_INFO(
-      this->get_logger(),
-      "SM_WAIT_EXECUTION_RESULT: Manager semaphore -> skip failed step and allow next plan dispatch");
-    publishAllowNextCycle();
+    finishFailedStep(can_continue);
   }
 
   std::string getCorrectiveInstruction(
@@ -3672,12 +3697,42 @@ private:
     if (decision.behavior == supervisor_manager::NavigationRecovery::Behavior::NONE) {
       return false;
     }
+    RCLCPP_WARN(get_logger(), "[NavigationRecovery] BEGIN error='%s' action='%s' argument='%s' behavior=%s",
+      error.c_str(), feedback.action.c_str(), feedback.argument.c_str(),
+      navigationBehaviorName(decision.behavior));
     navigation_error_ = error;
     navigation_argument_ = feedback.argument;
     navigation_decision_ = decision;
     navigation_prompt_ = decision.phrase;
-    navigation_io_state_ = NavigationIoState::START_SPEAK;
+    setNavigationState(NavigationIoState::START_SPEAK);
     return true;
+  }
+
+  const char * navigationBehaviorName(supervisor_manager::NavigationRecovery::Behavior behavior) const
+  {
+    using B = supervisor_manager::NavigationRecovery::Behavior;
+    switch (behavior) {
+      case B::ASK_LOCATION: return "ASK_LOCATION";
+      case B::RETRY: return "RETRY";
+      case B::ABORT: return "ABORT";
+      default: return "NONE";
+    }
+  }
+
+  void setNavigationState(NavigationIoState next)
+  {
+    const auto name = [](NavigationIoState state) {
+      switch (state) {
+        case NavigationIoState::START_SPEAK: return "START_SPEAK";
+        case NavigationIoState::WAIT_SPEAK: return "WAIT_SPEAK";
+        case NavigationIoState::START_LISTEN: return "START_LISTEN";
+        case NavigationIoState::WAIT_LISTEN: return "WAIT_LISTEN";
+        default: return "IDLE";
+      }
+    };
+    RCLCPP_INFO(get_logger(), "[NavigationRecovery] state=%s -> %s error='%s' argument='%s'",
+      name(navigation_io_state_), name(next), navigation_error_.c_str(), navigation_argument_.c_str());
+    navigation_io_state_ = next;
   }
 
   bool tickNavigationRecovery()
@@ -3686,6 +3741,15 @@ private:
     if (navigation_io_state_ == NavigationIoState::IDLE) {return false;}
     const auto now = std::chrono::steady_clock::now();
     if (navigation_io_state_ == NavigationIoState::START_SPEAK) {
+      bool active = false;
+      if (navigation_decision_.behavior == Behavior::ABORT &&
+          continueAfterRecoveryFailure() && navigation_error_ != "bumper_triggered") {
+        navigation_prompt_ = getPlanActiveStatus(active) && active ?
+          "I could not complete this navigation step. I will continue with the plan." :
+          "I could not complete this navigation step. There are no more steps.";
+      }
+      RCLCPP_INFO(get_logger(), "[NavigationRecovery] auxiliary SAY text='%s' (direct HRI service)",
+        navigation_prompt_.c_str());
       navigation_deadline_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(navigation_recovery_->serviceTimeoutSec()));
       if (talker_client_->service_is_ready()) {
@@ -3693,29 +3757,37 @@ private:
         req->text = navigation_prompt_;
         navigation_talk_future_ = talker_client_->async_send_request(req).share();
       }
-      navigation_io_state_ = NavigationIoState::WAIT_SPEAK;
+      setNavigationState(NavigationIoState::WAIT_SPEAK);
       return true;
     }
     if (navigation_io_state_ == NavigationIoState::WAIT_SPEAK) {
       const bool ready = navigation_talk_future_ &&
         navigation_talk_future_->wait_for(0s) == std::future_status::ready;
       if (!ready && now < navigation_deadline_) {return true;}
-      if (ready) {navigation_talk_future_->get();}
-      else {talker_client_->prune_pending_requests();}
+      if (ready) {
+        const auto response = navigation_talk_future_->get();
+        RCLCPP_INFO(get_logger(), "[NavigationRecovery] SAY completed success=%s message='%s'",
+          response->success ? "true" : "false", response->message.c_str());
+      } else {
+        RCLCPP_WARN(get_logger(), "[NavigationRecovery] SAY unavailable or timed out");
+        talker_client_->prune_pending_requests();
+      }
       navigation_talk_future_.reset();
       if (navigation_decision_.behavior == Behavior::ABORT) {
-        navigation_io_state_ = NavigationIoState::IDLE;
-        state_ = State::SM_FINISH;
+        setNavigationState(NavigationIoState::IDLE);
+        navigation_recovery_->reset();
+        finishFailedStep(continueAfterRecoveryFailure() && navigation_error_ != "bumper_triggered");
       } else if (navigation_decision_.behavior == Behavior::RETRY) {
-        navigation_io_state_ = NavigationIoState::IDLE;
+        setNavigationState(NavigationIoState::IDLE);
         publishRetryCommand();
         publishAllowNextCycle();
       } else {
-        navigation_io_state_ = NavigationIoState::START_LISTEN;
+        setNavigationState(NavigationIoState::START_LISTEN);
       }
       return true;
     }
     if (navigation_io_state_ == NavigationIoState::START_LISTEN) {
+      RCLCPP_INFO(get_logger(), "[NavigationRecovery] auxiliary LISTEN known_location (direct HRI service)");
       navigation_deadline_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(navigation_recovery_->serviceTimeoutSec()));
       if (listener_client_->service_is_ready()) {
@@ -3724,7 +3796,7 @@ private:
         req->grammar = "";
         navigation_listen_future_ = listener_client_->async_send_request(req).share();
       }
-      navigation_io_state_ = NavigationIoState::WAIT_LISTEN;
+      setNavigationState(NavigationIoState::WAIT_LISTEN);
       return true;
     }
     const bool ready = navigation_listen_future_ &&
@@ -3733,23 +3805,32 @@ private:
     std::string destination;
     if (ready) {
       const auto response = navigation_listen_future_->get();
+      RCLCPP_INFO(get_logger(), "[NavigationRecovery] LISTEN completed success=%s speech='%s'",
+        response->success ? "true" : "false", response->recognized_speech.c_str());
       if (response->success) {destination = normalizeKnowledgeToken(response->recognized_speech);}
-    } else {listener_client_->prune_pending_requests();}
+    } else {
+      RCLCPP_WARN(get_logger(), "[NavigationRecovery] LISTEN unavailable or timed out");
+      listener_client_->prune_pending_requests();
+    }
     navigation_listen_future_.reset();
     // Accept only a canonical known location, never free text as an instruction.
     if (!destination.empty() && loadKnownLocations() && known_location_aliases_.count(destination)) {
       destination = known_location_aliases_.at(destination);
       navigation_argument_ = destination;
-      navigation_io_state_ = NavigationIoState::IDLE;
+      setNavigationState(NavigationIoState::IDLE);
       // Override becomes supervisor_plan's last instruction, so subsequent
       // retries use the corrected destination without rewinding the plan.
       dispatchOverrideInstruction("Justina go_to " + destination);
     } else {
+      RCLCPP_WARN(get_logger(), "[NavigationRecovery] destination rejected='%s'; evaluating next attempt",
+        destination.c_str());
       navigation_decision_ = navigation_recovery_->handle(navigation_error_, navigation_argument_);
+      RCLCPP_INFO(get_logger(), "[NavigationRecovery] next behavior=%s",
+        navigationBehaviorName(navigation_decision_.behavior));
       navigation_prompt_ = navigation_decision_.behavior == Behavior::ABORT ?
         navigation_decision_.phrase : navigation_decision_.invalid_phrase;
       if (navigation_prompt_.empty()) {navigation_prompt_ = navigation_decision_.phrase;}
-      navigation_io_state_ = NavigationIoState::START_SPEAK;
+      setNavigationState(NavigationIoState::START_SPEAK);
     }
     return true;
   }
@@ -4308,7 +4389,6 @@ private:
     }
   }
 
-  enum class NavigationIoState {IDLE, START_SPEAK, WAIT_SPEAK, START_LISTEN, WAIT_LISTEN};
   NavigationIoState navigation_io_state_{NavigationIoState::IDLE};
   std::unique_ptr<supervisor_manager::NavigationRecovery> navigation_recovery_;
   supervisor_manager::NavigationRecovery::Decision navigation_decision_;
