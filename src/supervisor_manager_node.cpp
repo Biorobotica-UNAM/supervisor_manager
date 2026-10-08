@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -684,67 +685,171 @@ private:
     }
   }
 
-  bool loadKnownLocations()
+  static std::string trimString(const std::string & s)
   {
-    if (known_locations_loaded_) {
+    const auto first = s.find_first_not_of(" \t\n\r\"'");
+    if (first == std::string::npos) {
+      return "";
+    }
+    const auto last = s.find_last_not_of(" \t\n\r\"'");
+    return s.substr(first, last - first + 1);
+  }
+
+  bool loadKnownLocations(bool force_reload = false)
+  {
+    if (known_locations_loaded_ && !force_reload) {
       return !known_locations_.empty();
     }
 
-    try {
-      const std::string bank_path =
-        ament_index_cpp::get_package_share_directory("knowledge_bank");
-      const std::string locations_path = bank_path + "/domains/locations.yaml";
-      const YAML::Node root = YAML::LoadFile(locations_path);
+    if (force_reload) {
+      known_locations_.clear();
+      known_persons_.clear();
+      known_locations_loaded_ = false;
+    }
 
-      if (!root.IsMap()) {
-        RCLCPP_ERROR(
-          this->get_logger(),
-          "[Pipeline][Step 2] locations.yaml is not a map: %s",
-          locations_path.c_str());
-        known_locations_loaded_ = true;
-        return false;
+    try {
+      // 1) Cargar ubicaciones de navegacion desde locations_manager/config/known_locations.yaml
+      // Priorizar el archivo directamente en src/Navigation/navigation_controller/locations_manager/config/known_locations.yaml
+      std::string known_loc_path;
+      const std::string ws_path =
+        "src/Navigation/navigation_controller/locations_manager/config/known_locations.yaml";
+      if (std::filesystem::exists(ws_path)) {
+        known_loc_path = ws_path;
+      } else {
+        try {
+          known_loc_path =
+            ament_index_cpp::get_package_share_directory("locations_manager") +
+            "/config/known_locations.yaml";
+        } catch (const std::exception &) {
+          known_loc_path = "";
+        }
       }
 
-      for (const auto & category : root) {
-        if (category.first.IsScalar()) {
-          addKnownLocationToken(category.first.as<std::string>());
-        }
-
-        if (!category.second.IsSequence()) {
-          continue;
-        }
-
-        for (const auto & item : category.second) {
-          if (!item.IsScalar()) {
-            continue;
+      if (!known_loc_path.empty() && std::filesystem::exists(known_loc_path)) {
+        const YAML::Node root = YAML::LoadFile(known_loc_path);
+        if (root.IsMap()) {
+          for (const auto & entry : root) {
+            if (entry.first.IsScalar()) {
+              addKnownLocationToken(entry.first.as<std::string>());
+            }
           }
-
-          addKnownLocationToken(item.as<std::string>());
         }
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[Pipeline][Step 2] Loaded %zu locations from %s",
+          known_locations_.size(),
+          known_loc_path.c_str());
+      }
+
+      // 2) Si locations_manager no tenia ubicaciones, usar knowledge_bank/domains/locations.yaml como fallback
+      if (known_locations_.empty()) {
+        try {
+          const std::string bank_path =
+            ament_index_cpp::get_package_share_directory("knowledge_bank");
+          const std::string locations_path = bank_path + "/domains/locations.yaml";
+          if (std::filesystem::exists(locations_path)) {
+            const YAML::Node root = YAML::LoadFile(locations_path);
+            if (root.IsMap()) {
+              for (const auto & category : root) {
+                if (category.first.IsScalar()) {
+                  addKnownLocationToken(category.first.as<std::string>());
+                }
+                if (category.second.IsSequence()) {
+                  for (const auto & item : category.second) {
+                    if (item.IsScalar()) {
+                      addKnownLocationToken(item.as<std::string>());
+                    }
+                  }
+                }
+              }
+            }
+            RCLCPP_INFO(
+              this->get_logger(),
+              "[Pipeline][Step 2] Loaded %zu fallback locations from %s",
+              known_locations_.size(),
+              locations_path.c_str());
+          }
+        } catch (const std::exception & ex) {
+          RCLCPP_WARN(
+            this->get_logger(),
+            "[Pipeline][Step 2] Fallback locations.yaml failed: %s",
+            ex.what());
+        }
+      }
+
+      // 3) Cargar nombres de personas conocidos para no confundirlos con locaciones en deliver(to=...)
+      try {
+        const std::string bank_path =
+          ament_index_cpp::get_package_share_directory("knowledge_bank");
+        const std::string names_path = bank_path + "/dictionaries/names.yaml";
+        if (std::filesystem::exists(names_path)) {
+          const YAML::Node names_root = YAML::LoadFile(names_path);
+          if (names_root.IsMap() && names_root["patterns"] && names_root["patterns"].IsSequence()) {
+            for (const auto & item : names_root["patterns"]) {
+              if (item.IsScalar()) {
+                known_persons_.insert(normalizeKnowledgeToken(item.as<std::string>()));
+              }
+            }
+          }
+        }
+      } catch (const std::exception &) {
+        // Diccionario de nombres opcional
       }
 
       known_locations_loaded_ = true;
       RCLCPP_INFO(
         this->get_logger(),
-        "[Pipeline][Step 2] Loaded %zu known destinations from %s",
+        "[Pipeline][Step 2] Destination validator ready: %zu known locations, %zu known person names",
         known_locations_.size(),
-        locations_path.c_str());
+        known_persons_.size());
       return !known_locations_.empty();
     } catch (const std::exception & ex) {
       RCLCPP_ERROR(
         this->get_logger(),
-        "[Pipeline][Step 2] Could not load knowledge_bank locations: %s",
+        "[Pipeline][Step 2] Could not load known locations: %s",
         ex.what());
       known_locations_loaded_ = true;
       return false;
     }
   }
 
+  bool isKnownPersonName(const std::string & name) const
+  {
+    const std::string normalized = normalizeKnowledgeToken(name);
+    return known_persons_.find(normalized) != known_persons_.end();
+  }
+
   bool isSpecialSemanticDestination(const std::string & destination) const
   {
     return destination == "unknown" ||
            destination == "user" ||
-           destination == "person_recipient";
+           destination == "me" ||
+           destination == "person" ||
+           destination == "someone" ||
+           destination == "anybody" ||
+           destination == "person_recipient" ||
+           isKnownPersonName(destination);
+  }
+
+  void checkLocationCandidate(
+    const std::string & raw_location,
+    const std::string & field_name,
+    SemanticValidationResult & result)
+  {
+    const std::string normalized_location = normalizeKnowledgeToken(raw_location);
+
+    if (field_name == "destination" && normalized_location == "unknown") {
+      result.valid = false;
+      result.unknown_destination = true;
+    } else if (!normalized_location.empty() &&
+               normalized_location != "unknown" &&
+               !isSpecialSemanticDestination(normalized_location) &&
+               !known_locations_.empty() &&
+               known_locations_.find(normalized_location) == known_locations_.end())
+    {
+      result.valid = false;
+      result.invalid_destinations.push_back(raw_location);
+    }
   }
 
   bool isSemanticLocationField(const std::string & field_name) const
@@ -823,6 +928,93 @@ private:
     return true;
   }
 
+  void validateGoalString(
+    const std::string & goal_str,
+    SemanticValidationResult & result)
+  {
+    const auto open_paren = goal_str.find('(');
+    const auto close_paren = goal_str.rfind(')');
+    if (open_paren == std::string::npos || close_paren == std::string::npos || close_paren <= open_paren) {
+      return;
+    }
+
+    std::string verb = goal_str.substr(0, open_paren);
+    verb = normalizeKnowledgeToken(verb);
+
+    const std::string args_str = goal_str.substr(open_paren + 1, close_paren - open_paren - 1);
+
+    std::vector<std::string> positional_args;
+    std::vector<std::pair<std::string, std::string>> kwargs;
+
+    std::string current;
+    char in_quote = '\0';
+    for (size_t i = 0; i < args_str.size(); ++i) {
+      char c = args_str[i];
+      if (in_quote != '\0') {
+        if (c == in_quote) {
+          in_quote = '\0';
+        } else {
+          current += c;
+        }
+      } else if (c == '\'' || c == '"') {
+        in_quote = c;
+      } else if (c == ',') {
+        std::string token = trimString(current);
+        if (!token.empty()) {
+          const auto eq_pos = token.find('=');
+          if (eq_pos != std::string::npos) {
+            std::string k = trimString(token.substr(0, eq_pos));
+            std::string v = trimString(token.substr(eq_pos + 1));
+            kwargs.emplace_back(normalizeKnowledgeToken(k), v);
+          } else {
+            positional_args.push_back(token);
+          }
+        }
+        current.clear();
+      } else {
+        current += c;
+      }
+    }
+    std::string token = trimString(current);
+    if (!token.empty()) {
+      const auto eq_pos = token.find('=');
+      if (eq_pos != std::string::npos) {
+        std::string k = trimString(token.substr(0, eq_pos));
+        std::string v = trimString(token.substr(eq_pos + 1));
+        kwargs.emplace_back(normalizeKnowledgeToken(k), v);
+      } else {
+        positional_args.push_back(token);
+      }
+    }
+
+    // 1) Acciones de navegacion: go(loc), move(loc), navigate(loc), head(loc)
+    if ((verb == "go" || verb == "move" || verb == "navigate" || verb == "head") &&
+        !positional_args.empty())
+    {
+      checkLocationCandidate(positional_args.front(), "destination", result);
+    }
+
+    // 2) Acciones de colocacion: place(obj, surface) o drop(obj, container)
+    if ((verb == "place" || verb == "drop") && positional_args.size() >= 2)
+    {
+      checkLocationCandidate(positional_args[1], "destination", result);
+    }
+
+    // 3) Keyword arguments que especifican ubicaciones
+    for (const auto & kw : kwargs) {
+      const std::string & key = kw.first;
+      const std::string & val = kw.second;
+
+      if (key == "to" || key == "destination") {
+        checkLocationCandidate(val, "destination", result);
+      } else if (key == "on" || key == "in" || key == "at" || key == "location") {
+        checkLocationCandidate(val, "location", result);
+      } else if (key == "from" || key == "source") {
+        checkLocationCandidate(val, "source", result);
+      }
+    }
+  }
+
   void validateJsonDestinations(
     const nlohmann::json & value,
     SemanticValidationResult & result)
@@ -831,20 +1023,7 @@ private:
       for (const auto & item : value.items()) {
         if (isSemanticLocationField(item.key()) && item.value().is_string()) {
           const std::string raw_location = item.value().get<std::string>();
-          const std::string normalized_location = normalizeKnowledgeToken(raw_location);
-
-          if (item.key() == "destination" && normalized_location == "unknown") {
-            result.valid = false;
-            result.unknown_destination = true;
-          } else if (!normalized_location.empty() &&
-                     normalized_location != "unknown" &&
-                     !isSpecialSemanticDestination(normalized_location) &&
-                     !known_locations_.empty() &&
-                     known_locations_.find(normalized_location) == known_locations_.end())
-          {
-            result.valid = false;
-            result.invalid_destinations.push_back(raw_location);
-          }
+          checkLocationCandidate(raw_location, item.key(), result);
         }
 
         validateJsonDestinations(item.value(), result);
@@ -854,7 +1033,11 @@ private:
 
     if (value.is_array()) {
       for (const auto & item : value) {
-        validateJsonDestinations(item, result);
+        if (item.is_string()) {
+          validateGoalString(item.get<std::string>(), result);
+        } else {
+          validateJsonDestinations(item, result);
+        }
       }
     }
   }
@@ -874,7 +1057,7 @@ private:
         return result;
       }
 
-      const bool can_validate_locations = loadKnownLocations();
+      const bool can_validate_locations = loadKnownLocations(true);
       validateJsonDestinations(parsed, result);
 
       if (!can_validate_locations) {
@@ -1046,7 +1229,7 @@ private:
                   : RetryPrompt::RepeatInvalidDestination;
                 RCLCPP_WARN(
                   this->get_logger(),
-                  "[Pipeline][Step 2] Semantic destination '%s' is not in knowledge_bank/domains/locations.yaml; attempt %d",
+                  "[Pipeline][Step 2] Semantic destination '%s' is not in known_locations; attempt %d",
                   invalid_destination.c_str(),
                   invalid_destination_attempts);
               }
@@ -3979,10 +4162,18 @@ private:
             nav_retry_count_ = 0;
             RCLCPP_WARN(
               this->get_logger(),
-              "SM_WAIT_EXECUTION_RESULT: go_to '%s' references an unknown location; skipping retry. worker='%s'",
+              "SM_WAIT_EXECUTION_RESULT: go_to '%s' references an unknown location; aborting task. worker='%s'",
               feedback.argument.c_str(),
               feedback.worker_result.c_str());
-            announceFailureAndContinue(feedback, "navigation_failed - location not found");
+            sayText(
+              "I cannot continue this task because the destination " +
+              makeSpeechFriendly(feedback.argument) +
+              " does not exist in my known locations.");
+            if (natural_language_planning_) {
+              state_ = State::SM_CREATE_PLAN;
+            } else {
+              state_ = State::SM_FINISH;
+            }
             break;
           }
 
@@ -4260,6 +4451,7 @@ private:
   bool at_instruction_point_{false};
   bool known_locations_loaded_{false};
   std::unordered_set<std::string> known_locations_;
+  std::unordered_set<std::string> known_persons_;
 
   // FSM
   State state_{State::SM_INIT};
