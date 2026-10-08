@@ -1,0 +1,9 @@
+# A recovery cycle consists of approach followed by the original take.
+cases:
+  take_pose_out_of_range:
+    enabled: true
+    max_attempts: 1
+    phrase: "I need to get closer first."
+    approach_instruction: "Justina approach {argument}"
+    take_instruction: "Justina take {argument}"
+    failed_phrase: "I could not recover the grasp."

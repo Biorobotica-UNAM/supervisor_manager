@@ -18,6 +18,7 @@ from clips_interfaces.srv import String
 from std_srvs.srv import Trigger
 from std_msgs.msg import String as Text, Empty, Bool
 from supervisor_interfaces.msg import SystemStatus, TaskExecutionReport
+from known_locations_interfaces.srv import LocationsGet
 from listener_interfaces.srv import Listen
 from talker_interfaces.srv import Talk
 
@@ -28,6 +29,9 @@ def executable(package, name):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--manipulation', action='store_true')
+    parser.add_argument('--fail-recovery', choices=['approach', 'take'])
+    parser.add_argument('--real-locations', action='store_true')
     parser.add_argument('--exhausted', action='store_true')
     parser.add_argument('--continue-on-failure', action='store_true')
     args = parser.parse_args()
@@ -45,10 +49,12 @@ def main():
         Bool, '/fixture/plan_active',
         lambda msg: active_pending.append((time.monotonic() + 0.8, msg)), 10)
     listen_answers = iter(['unknown place', 'still unknown'] if args.exhausted else
-                          ['unknown place', 'kitchen table'])
+                          ['Please go to the kitchen.', 'Could you go to the cooking table?'])
 
     def plan(req, res):
-        raw.publish(Text(data='Paso 1: Justina go_to missing\nPaso 2: Justina say done'))
+        raw.publish(Text(data=('Paso 1: Justina take demo_object_1\nPaso 2: Justina say done'
+                               if args.manipulation else
+                               'Paso 1: Justina go_to missing\nPaso 2: Justina say done')))
         res.success = True
         return res
 
@@ -62,9 +68,16 @@ def main():
         res.recognized_speech = next(listen_answers)
         return res
 
+    def validate_location(req, res):
+        res.success = req.location_name == 'cooking_table'
+        res.message = 'OK' if res.success else "Location '%s' not found." % req.location_name
+        return res
+
     services = [node.create_service(Trigger, '/planning/clips/start_planning', plan),
                 node.create_service(Talk, '/hri/talker/talk', talk),
                 node.create_service(Listen, '/hri/listener/listen', listen)]
+    if not args.real_locations:
+        services.append(node.create_service(LocationsGet, '/locations_manager/get', validate_location))
     client = node.create_client(Trigger, '/request_instruction')
     subscription = None
     recreate_at = None
@@ -79,6 +92,16 @@ def main():
                      '-r', '/supervisor/supervisor_plan/active:=/fixture/plan_active'], stdout=handles[0], stderr=subprocess.STDOUT),
                  subprocess.Popen([executable('supervisor_manager', 'supervisor_manager_node'), '--ros-args',
                      '-p', 'continue_on_recovery_failure:=' + str(args.continue_on_failure).lower()], stdout=handles[1], stderr=subprocess.STDOUT)]
+    handles.append(open(Path(logs) / 'entities.log', 'w'))
+    processes.append(subprocess.Popen(
+        [executable('semantic_parser', 'entity_extractor_node'), '--ros-args',
+         '-r', '__ns:=/planning/semantic_parser'],
+        stdout=handles[-1], stderr=subprocess.STDOUT))
+    if args.real_locations:
+        handles.append(open(Path(logs) / 'locations.log', 'w'))
+        processes.append(subprocess.Popen(
+            [executable('locations_manager', 'locations_manager_node')],
+            stdout=handles[-1], stderr=subprocess.STDOUT))
     started = time.monotonic()
     try:
         while time.monotonic() - started < 35:
@@ -100,7 +123,19 @@ def main():
                 action, argument = parts[1], parts[2]
                 report = TaskExecutionReport(action=action, argument=argument, approved=True,
                     status=TaskExecutionReport.SUCCESS, failure_reason='none', worker_result='success')
-                if argument == 'missing':
+                if args.manipulation and action == 'take' and (
+                        instructions.count('Justina take demo_object_1') == 1 or
+                        args.fail_recovery == 'take'):
+                    report.approved = False
+                    report.status = TaskExecutionReport.FAILURE
+                    report.failure_reason = 'argument_mismatch'
+                    report.worker_result = 'pose_out_of_range'
+                elif args.manipulation and action == 'approach' and args.fail_recovery == 'approach':
+                    report.approved = False
+                    report.status = TaskExecutionReport.FAILURE
+                    report.failure_reason = 'navigation_failed'
+                    report.worker_result = 'navigation_failed: blocked path'
+                elif argument == 'missing':
                     report.approved = False
                     report.status = TaskExecutionReport.FAILURE
                     report.failure_reason = 'location_not_found'
@@ -108,7 +143,7 @@ def main():
                     node.destroy_subscription(subscription)
                     subscription = None
                     recreate_at = now + 2.5
-                elif action == 'go_to' and instructions.count('Justina go_to kitchen_table') == 1:
+                elif action == 'go_to' and instructions.count('Justina go_to cooking_table') == 1:
                     report.approved = False
                     report.status = TaskExecutionReport.FAILURE
                     report.failure_reason = 'navigation_failed'
@@ -126,6 +161,21 @@ def main():
                 break
         assert processes[1].poll() == 0, f'manager did not finish; logs: {logs}'
         manager_log = (Path(logs) / 'manager.log').read_text()
+        if args.manipulation:
+            expected = ['Justina take demo_object_1', 'Justina approach demo_object_1']
+            if args.fail_recovery != 'approach':
+                expected.append('Justina take demo_object_1')
+            if not args.fail_recovery or args.continue_on_failure:
+                expected.append('Justina say done')
+            assert instructions == expected, instructions
+            assert '[ManipulationRecovery] state=IDLE -> WAIT_APPROACH' in manager_log
+            assert "inserted instruction='Justina approach demo_object_1'" in manager_log
+            if args.fail_recovery:
+                outcome = 'CONTINUE' if args.continue_on_failure else 'STOP'
+                assert '[RecoveryOutcome] ' + outcome in manager_log
+            print('PASS: manipulation sequence, recovery ownership, continuation and limits')
+            print(f'Logs: {logs}')
+            return
         assert '[NavigationRecovery] BEGIN' in manager_log, manager_log
         assert 'state=START_SPEAK -> WAIT_SPEAK' in manager_log, manager_log
         assert 'auxiliary LISTEN known_location' in manager_log, manager_log
@@ -143,12 +193,12 @@ def main():
             print('PASS: exhausted location captures abort without advancing the original plan')
             print(f'Logs: {logs}')
             return
-        assert instructions == ['Justina go_to missing', 'Justina go_to kitchen_table',
-                                'Justina go_to kitchen_table', 'Justina say done'], instructions
+        assert instructions == ['Justina go_to missing', 'Justina go_to cooking_table',
+                                'Justina go_to cooking_table', 'Justina say done'], instructions
         assert any('another location' in phrase for phrase in phrases), phrases
         assert any('not a known location' in phrase for phrase in phrases), phrases
         assert any('try again' in phrase for phrase in phrases), phrases
-        assert "[PlanMutation] inserted instruction='Justina go_to kitchen_table'" in manager_log
+        assert "[PlanMutation] inserted instruction='Justina go_to cooking_table'" in manager_log
         assert '[PlanMutation] queued command=1' in manager_log
         print('PASS: corrected destination persists across retry, invalid input reprompted, late executor recovered, delayed plan status retained, next original step preserved')
         print(f'Logs: {logs}')

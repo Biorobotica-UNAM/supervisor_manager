@@ -1,0 +1,97 @@
+# Common configuration of the extracted modules. Reload requires a manager restart.
+coordinator:
+  execution_timeout_sec: 180.0
+  cancel_timeout_sec: 5.0
+navigation:
+  cases:
+    alignment_failed:
+      actions: [align]
+      max_retries: 2
+      phrase: "I will try to align again."
+    approach_failed:
+      actions: [approach, approach_partial]
+      max_retries: 2
+      phrase: "I will try to approach again."
+perception:
+  cases:
+    object_not_found:
+      actions: [find_object]
+      reasons: [object_not_found]
+      worker_prefix: "object_not_found:"
+      worker_suffix: "_not_found"
+      max_retries: 2
+      phrase: "I will look for {argument} again."
+    space_not_found:
+      actions: [find_space]
+      max_retries: 2
+      phrase: "I will look for a safe placement space again."
+    analysis_failed:
+      actions: [analyze, analyze_objects, analyze_object]
+      max_retries: 2
+      phrase: "I will analyze the objects again."
+    focus_failed:
+      actions: [focus]
+      max_retries: 1
+      phrase: "I will try to focus again."
+person:
+  reprompt_every: 3
+  max_sequence_failures: 3
+  cases:
+    anybody_not_found:
+      actions: [find_person]
+      worker_prefix: "person_not_found:"
+      max_retries: 2
+      phrase: "I will look for the person again."
+    pose_not_found:
+      actions: [find_pose]
+      max_retries: 2
+      phrase: "Please keep waving or raising your hand while I look for you."
+    person_analysis_failed:
+      actions: [analyze_person]
+      max_retries: 2
+      phrase: "I will analyze the person again."
+interaction:
+  confirmation_attempts: 2
+  continue_timeout_sec: 180
+  continue_max_attempts: 3
+  cases:
+    speech_failed:
+      actions: [say]
+      max_retries: 1
+      phrase: ""
+    listen_failed:
+      actions: [listen, listen_for]
+      max_retries: 2
+      phrase: "I could not hear the answer. Please repeat it."
+    wait_failed:
+      actions: [wait_for, check]
+      max_retries: 2
+      phrase: "I will check again."
+door:
+  max_attempts: 3
+  retry_delay_sec: 5.0
+  execution_timeout_sec: 15.0
+  closed_phrase: "Please open the door so I can continue."
+  service_failed_phrase: "I could not check the door. I will try again."
+  opened_phrase: "I detected that the door is open. Thank you."
+  exhausted_phrase: "I could not confirm that the door is open."
+follow:
+  reprompt_every: 1
+  start_attempts: 3
+  stop_attempts: 3
+  disable_attempts: 3
+  execution_timeout_sec: 30.0
+  destination_timeout_sec: 180.0
+  poll_interval_sec: 0.5
+  start_retry_phrase: "Please say follow, continue, or stop."
+  stop_retry_phrase: "Say stop when you want me to stop."
+  failed_phrase: "I could not complete the following sequence."
+manipulation:
+  max_take_pnp_attempts: 3
+  cases:
+    verify_failed:
+      actions: [verify_take]
+      max_retries: 1
+      phrase: "I will verify the grasp again."
+task_acquisition:
+  command_rounds: 2

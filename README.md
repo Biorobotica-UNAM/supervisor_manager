@@ -151,16 +151,22 @@ un lenguaje general para secuencias arbitrarias de pasos.
 ### Ubicación corregida
 
 La escucha se realiza de forma asíncrona con un tiempo límite configurable
-(`service_timeout_sec`). Se admite un nombre de ubicación del listado de
-`knowledge_bank/domains/locations.yaml`, normalizando espacios, guiones y
-mayúsculas. También se resuelven nombres compactos, como `kitchentable`, al
-nombre canónico `kitchen_table`. Los encabezados de categoría no se aceptan
-como ubicaciones salvo que también estén en el listado.
+(`service_timeout_sec`). El nombre se normaliza (espacios y guiones a `_`,
+minúsculas) y se consulta mediante `locations_manager/get`, sin iniciar movimiento.
+Solo `success=true` permite insertar el nuevo `go_to`. La recuperación no valida
+contra `knowledge_bank/domains/locations.yaml`: ese catálogo se conserva para
+el pipeline semántico GPSR y no garantiza que exista una pose navegable.
 
-No se interpreta una oración libre como instrucción. Una respuesta desconocida,
-silencio o fallo del servicio consume un intento y vuelve a pedir la ubicación.
-Un nombre del dominio puede no estar registrado en navegación: si el ejecutor
-lo rechaza, se vuelve a aplicar el caso con el presupuesto restante.
+El servicio se configura mediante `navigation_locations_service`, cuyo valor
+predeterminado es `/locations_manager/get`. Si navegación usa un namespace,
+configura la misma ruta que usa su controlador. Los logs `VALIDATE` muestran la
+ruta, el nombre consultado y la respuesta. No se aceptan nombres compactos ni
+alias que no estén registrados en navegación.
+
+Una respuesta desconocida, silencio, fallo o timeout del servicio consume un
+intento y vuelve a pedir la ubicación. Nunca se inserta un destino sin confirmar
+su existencia. La consulta usa el catálogo actualmente cargado por navegación,
+incluidas las ubicaciones guardadas durante la ejecución.
 
 El destino corregido se ejecuta como sustitución del paso fallido y queda como
 última instrucción enviada por el plan. Por eso los siguientes reintentos usan
@@ -268,3 +274,77 @@ ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST /usr/bin/python3 \
   src/Supervisor/supervisor_manager/test/navigation_pilot_smoke.py \
   --exhausted --continue-on-failure
 ```
+
+
+## Fuente de ubicaciones navegables
+
+La recuperación consulta el servicio existente de `locations_manager`, sin
+modificar ese paquete ni leer directamente su archivo. El catálogo que dicho
+nodo tenga cargado es la fuente de verdad. `navigation_locations_service`
+permite elegir la misma ruta de servicio que usa el controlador de navegación.
+La validación y carga del archivo de coordenadas quedan a cargo de ese paquete.
+
+Prueba integrada con `locations_manager` real, sin hardware:
+
+```bash
+ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST /usr/bin/python3 \
+  src/Supervisor/supervisor_manager/test/navigation_pilot_smoke.py --real-locations
+```
+
+Comprueba que `kitchen` (solo semántico) sea rechazado y `cooking_table`
+(con pose navegable, ausente del listado semántico) sea aceptado.
+
+
+## Recuperación de manipulación: take fuera de alcance
+
+`ManipulationRecovery` mantiene el estado y el presupuesto de la secuencia
+`approach objeto -> take objeto`. La configuración está en
+`config/manipulation_recovery.yaml`; se puede seleccionar otro archivo con el
+parámetro `manipulation_recovery_config`. Reinicia el manager para recargarla.
+
+El caso `take_pose_out_of_range` se activa únicamente al fallar `take` con
+`pose_out_of_range`. La secuencia y su estado están fuera del manager; este
+aplica los comandos devueltos por la clase y anuncia las frases mediante HRI.
+Los logs `[ManipulationRecovery]` muestran estados y resultados; `[PlanMutation]`
+muestra cada instrucción insertada. La llamada de voz del adaptador todavía es
+síncrona, como otras frases del manager.
+
+```yaml
+cases:
+  take_pose_out_of_range:
+    enabled: true
+    max_attempts: 1
+    phrase: "Necesito acercarme antes de intentar agarrar el objeto."
+    approach_instruction: "Justina approach {argument}"
+    take_instruction: "Justina take {argument}"
+    failed_phrase: "No pude recuperar el agarre."
+```
+
+`max_attempts` cuenta ciclos adicionales completos. Si el acercamiento falla,
+la secuencia termina sin intentar take. Si el take vuelve a fallar por alcance,
+puede iniciar otro ciclo mientras quede presupuesto. Otro error del take termina
+la recuperación. El agotamiento respeta `continue_on_recovery_failure`; bumper
+siempre detiene. El éxito vuelve a la evaluación normal del reporte y conserva
+la verificación `verify_take` de PNP cuando corresponda. No se consume ningún
+paso adicional del plan original para insertar la secuencia.
+
+Por ahora las plantillas de instrucciones admitidas son las dos mostradas,
+con el mismo objeto. Las frases, enabled y max_attempts son configurables;
+el YAML no permite inventar acciones ni secuencias arbitrarias. La recuperación
+PNP ya activa conserva la propiedad de sus instrucciones y su política propia.
+Los reintentos generales de take por otros motivos siguen en el manager.
+
+Prueba sin hardware (plan y manager reales; ejecutor/HRI simulados):
+
+```bash
+ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST /usr/bin/python3 \
+  src/Supervisor/supervisor_manager/test/navigation_pilot_smoke.py --manipulation
+# Agrega --fail-recovery approach o --fail-recovery take para simular un fallo.
+# Agrega --continue-on-failure para comprobar que se retoma el plan original.
+```
+
+Pendiente de la separación completa: sacar del manager la ejecución de
+navegación (voz, escucha y consulta), completar drop y verificación de agarre en
+ManipulationRecovery, y extraer percepción, personas, interacción y políticas de
+seguimiento/GPSR. También faltan herramientas generales para editar secuencias
+del plan y reportes con identificador de ejecución/fase física.
