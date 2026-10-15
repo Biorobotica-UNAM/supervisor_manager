@@ -5,6 +5,11 @@ namespace supervisor_manager {
 bool NavigationRecoveryModule::handleFeedback(const Report & report)
 {
   if (handleNavigationFeedback(report)) {return true;}
+  if (isSuccessfulGoTo(report) && !arrival_original_.empty() &&
+      normalizeKnowledgeToken(report.argument) == normalizeKnowledgeToken(arrival_corrected_)) {
+    if (context_.update_arrival) {context_.update_arrival(arrival_original_, arrival_corrected_);}
+    arrival_original_.clear(); arrival_corrected_.clear();
+  }
   if (isSuccessfulFeedback(report)) {updateInstructionPointStateFromGoTo(report);}
   const auto decision = general_rules_.handle({report.action, report.argument, report.failure_reason,
     report.worker_result, isSuccessfulFeedback(report)});
@@ -192,6 +197,7 @@ bool NavigationRecoveryModule::tickNavigationRecovery()
       setNavigationState(NavigationIoState::IDLE);
       navigation_recovery_->reset();
       finishFailedStep(continueAfterRecoveryFailure() && navigation_error_ != "bumper_triggered");
+      arrival_original_.clear(); arrival_corrected_.clear();
     } else if (navigation_decision_.behavior == Behavior::RETRY) {
       setNavigationState(NavigationIoState::IDLE);
       publishRetryCommand();
@@ -286,6 +292,8 @@ bool NavigationRecoveryModule::tickNavigationRecovery()
     if (!response->success) {
       rejectNavigationDestination(response->message);
     } else {
+      if (arrival_original_.empty()) {arrival_original_ = navigation_argument_;}
+      arrival_corrected_ = navigation_candidate_;
       navigation_argument_ = navigation_candidate_;
       setNavigationState(NavigationIoState::IDLE);
       dispatchOverrideInstruction("Justina go_to " + navigation_argument_);

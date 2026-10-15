@@ -14,6 +14,10 @@ public:
   }
   void skip(int count) {if (count > 0) {operations_.push_back({{"command", -count}});}}
   void rewind() {operations_.push_back({{"rewind", true}});}
+  void updateArrival(const std::string & original, const std::string & corrected) {
+    if (original.empty() || corrected.empty()) {throw std::invalid_argument("empty arrival destination");}
+    operations_.push_back({{"arrival_destination", {{"original", original}, {"corrected", corrected}}}});
+  }
   void insert(const std::string & instruction) {
     if (instruction.empty()) {throw std::invalid_argument("empty corrective instruction");}
     for (const auto & operation : operations_) {

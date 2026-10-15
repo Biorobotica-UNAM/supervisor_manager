@@ -34,6 +34,7 @@ def main():
     parser.add_argument('--real-locations', action='store_true')
     parser.add_argument('--exhausted', action='store_true')
     parser.add_argument('--continue-on-failure', action='store_true')
+    parser.add_argument('--arrival-announcement', action='store_true')
     args = parser.parse_args()
     rclpy.init()
     node = Node('navigation_pilot_fixture')
@@ -54,7 +55,11 @@ def main():
     def plan(req, res):
         raw.publish(Text(data=('Paso 1: Justina take demo_object_1\nPaso 2: Justina say done'
                                if args.manipulation else
-                               'Paso 1: Justina go_to missing\nPaso 2: Justina say done')))
+                               'Paso 1: Justina go_to missing\n' +
+                               ('Paso 2: Justina say I have arrived at missing\n'
+                                'Paso 3: Justina say kitchen must remain unchanged\n'
+                                'Paso 4: Justina say done' if args.arrival_announcement else
+                                'Paso 2: Justina say done'))))
         res.success = True
         return res
 
@@ -193,13 +198,22 @@ def main():
             print('PASS: exhausted location captures abort without advancing the original plan')
             print(f'Logs: {logs}')
             return
-        assert instructions == ['Justina go_to missing', 'Justina go_to cooking_table',
-                                'Justina go_to cooking_table', 'Justina say done'], instructions
+        expected = ['Justina go_to missing', 'Justina go_to cooking_table',
+                    'Justina go_to cooking_table']
+        if args.arrival_announcement:
+            expected += ['Justina say I have arrived at cooking_table',
+                         'Justina say kitchen must remain unchanged']
+        expected.append('Justina say done')
+        assert instructions == expected, instructions
         assert any('another location' in phrase for phrase in phrases), phrases
         assert any('not a known location' in phrase for phrase in phrases), phrases
         assert any('try again' in phrase for phrase in phrases), phrases
         assert "[PlanMutation] inserted instruction='Justina go_to cooking_table'" in manager_log
         assert '[PlanMutation] queued command=1' in manager_log
+        if args.arrival_announcement:
+            assert 'Justina say I have arrived at cooking_table' in instructions, instructions
+            assert 'Justina say I have arrived at missing' not in instructions, instructions
+            assert 'Justina say kitchen must remain unchanged' in instructions, instructions
         print('PASS: corrected destination persists across retry, invalid input reprompted, late executor recovered, delayed plan status retained, next original step preserved')
         print(f'Logs: {logs}')
     finally:

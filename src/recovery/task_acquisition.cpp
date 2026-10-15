@@ -1,6 +1,20 @@
 #include "supervisor_manager/task_acquisition.hpp"
+#include "supervisor_manager/door_sequence.hpp"
 
 namespace supervisor_manager {
+
+bool TaskAcquisition::isGpsrConnectionFailure(const std::string & reason)
+{
+  std::string text = reason;
+  std::transform(text.begin(), text.end(), text.begin(),
+    [](unsigned char c) {return static_cast<char>(std::tolower(c));});
+  for (const auto * marker : {"connection refused", "[errno 111]", "all connection attempts failed",
+      "network is unreachable", "no route to host", "name or service not known",
+      "temporary failure in name resolution", "connect timeout", "connection timed out"}) {
+    if (text.find(marker) != std::string::npos) {return true;}
+  }
+  return false;
+}
 
 bool TaskAcquisition::goToInstructionPoint()
 {
@@ -347,6 +361,7 @@ void TaskAcquisition::markSemanticAbort(
   result.valid = false;
   result.command_aborted = true;
   result.abort_reason = reason;
+  result.server_unavailable = isGpsrConnectionFailure(reason);
   if (textMentionsUnknownDestination(reason)) {
     result.unknown_destination = true;
   }
@@ -372,6 +387,9 @@ bool TaskAcquisition::applySemanticAbortIfPresent(
     markSemanticAbort(result, reason->get<std::string>());
   } else {
     markSemanticAbort(result, "semantic parser aborted the command");
+  }
+  if (value.value("error_code", nlohmann::json{}) == "gpsr_unavailable") {
+    result.server_unavailable = true;
   }
 
   return true;
@@ -516,6 +534,10 @@ bool TaskAcquisition::runNaturalLanguagePipeline()
   if (!at_instruction_point_) {
     sayText("Im ready for GPSR task, ill navigate to the instruction point, please open the door.");
 
+    DoorSequence door(context_);
+    const bool may_navigate = door.beforeNavigation();
+    if (!may_navigate) {return false;}
+
     if (!goToInstructionPoint()) {
       RCLCPP_ERROR(this->get_logger(), "Pipeline failed at step -1: goToInstructionPoint failed");
       return false;
@@ -581,6 +603,14 @@ bool TaskAcquisition::runNaturalLanguagePipeline()
         if (!semantic.empty()) {
           const SemanticValidationResult validation = validateSemanticDestinations(semantic);
           if (!validation.valid) {
+            if (validation.server_unavailable) {
+              RCLCPP_ERROR(get_logger(), "[Pipeline][FATAL] GPSR server unavailable: %s",
+                validation.abort_reason.c_str());
+              sayText("I cannot connect to the GPSR server. I cannot process commands. "
+                "I will stop the supervisor.");
+              context_.stop();
+              return false;
+            }
             if (validation.command_aborted) {
               RCLCPP_WARN(
                 this->get_logger(),

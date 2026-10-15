@@ -190,6 +190,13 @@ public:
     context.config = YAML::LoadFile(get_parameter("recovery_modules_config").as_string());
     context.node = this; context.tf = &tf_buffer_;
     context.talker = talker_client_; context.listener = listener_client_;
+    context.update_arrival = [this](const std::string & original, const std::string & corrected) {
+      RCLCPP_INFO(get_logger(), "[PlanMutation] arrival destination='%s' -> '%s'",
+        original.c_str(), corrected.c_str());
+      plan_tools_.updateArrival(original, corrected);
+    };
+    context.door_check = this->create_client<std_srvs::srv::Trigger>(
+      "/hardware/door_detector/check", rmw_qos_profile_services_default, hri_client_group_);
     context.entities = this->create_client<semantic_parser_interfaces::srv::ExtractEntity>(
       "/planning/semantic_parser/extract_entity", rmw_qos_profile_services_default,
       hri_client_group_);
@@ -530,9 +537,11 @@ private:
           {
             RCLCPP_ERROR(
               this->get_logger(),
-              "SM_CREATE_PLAN: natural language pipeline failed -> back to VERIFY"
+              "SM_CREATE_PLAN: natural language pipeline failed"
             );
-            state_ = continueAfterRecoveryFailure() ? State::SM_VERIFY_SYS : State::SM_FINISH;
+            if (state_ != State::SM_FINISH) {
+              state_ = continueAfterRecoveryFailure() ? State::SM_VERIFY_SYS : State::SM_FINISH;
+            }
             break;
           }
         }

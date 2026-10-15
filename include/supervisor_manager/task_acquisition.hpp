@@ -8,6 +8,7 @@ class TaskAcquisition : public RecoverySupport {
     bool valid{true};
     bool unknown_destination{false};
     bool command_aborted{false};
+    bool server_unavailable{false};
     std::string abort_reason;
     std::vector<std::string> invalid_destinations;
   };
@@ -20,6 +21,7 @@ public:
   }
 
   bool run() {return runNaturalLanguagePipeline();}
+  static bool isGpsrConnectionFailure(const std::string & reason);
 
 private:
   bool goToInstructionPoint();

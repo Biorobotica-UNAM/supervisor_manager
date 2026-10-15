@@ -11,6 +11,7 @@
 #include <head_interfaces/srv/move_head.hpp>
 #include <known_locations_interfaces/srv/locations_get.hpp>
 #include <listener_interfaces/srv/listen.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <semantic_parser_interfaces/srv/extract_entity.hpp>
 #include <talker_interfaces/srv/talk.hpp>
 #include <planning_tools/Planning.hpp>
@@ -57,6 +58,7 @@ struct RecoveryContext {
   std::shared_ptr<Planning> planning;
   rclcpp::Client<talker_interfaces::srv::Talk>::SharedPtr talker;
   rclcpp::Client<listener_interfaces::srv::Listen>::SharedPtr listener;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr door_check;
   rclcpp::Client<semantic_parser_interfaces::srv::ExtractEntity>::SharedPtr entities;
   rclcpp::Client<known_locations_interfaces::srv::LocationsGet>::SharedPtr go_to, locations;
   rclcpp::Client<head_interfaces::srv::MoveHead>::SharedPtr head;
@@ -68,6 +70,7 @@ struct RecoveryContext {
   std::function<void()> retry, rewind, stop, clear_plan_ready;
   std::function<void(int)> skip;
   std::function<void(const std::string &)> insert;
+  std::function<void(const std::string &, const std::string &)> update_arrival;
   std::function<void(bool)> finish_failed;
   std::function<std::string()> current_instruction;
   std::function<bool(bool &)> plan_active;

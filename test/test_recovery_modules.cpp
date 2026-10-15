@@ -6,6 +6,7 @@
 #include "supervisor_manager/interaction_recovery.hpp"
 #include "supervisor_manager/manipulation_recovery_module.hpp"
 #include "supervisor_manager/plan_sequence_tools.hpp"
+#include "supervisor_manager/task_acquisition.hpp"
 
 namespace {
 using namespace supervisor_manager;
@@ -43,6 +44,35 @@ struct Fixture {
     };
   }
 };
+TEST(RecoveryModules, StartupDoorUsesSameBudgetWithoutPlanMutations) {
+  const bool initialized_here = !rclcpp::ok();
+  if (initialized_here) {rclcpp::init(0, nullptr);}
+  for (bool debug : {false, true}) {
+    for (bool opens : {false, true}) {
+      Fixture f; f.debug = debug;
+      DoorSequence door(f.context);
+      int checks = 0;
+      EXPECT_EQ(door.beforeNavigation([&](double timeout) {
+        EXPECT_GT(timeout, 0.0);
+        ++checks;
+        return result("check", "door", opens && checks == 2,
+          opens && checks == 2 ? "door_open" : "door_closed", "door_closed");
+      }), opens || debug);
+      EXPECT_EQ(checks, opens ? 2 : 3);
+      EXPECT_EQ(f.retries, 0); EXPECT_EQ(f.allows, 0);
+      EXPECT_FALSE(f.finished); EXPECT_TRUE(f.inserted.empty());
+    }
+  }
+  if (initialized_here) {rclcpp::shutdown();}
+}
+TEST(RecoveryModules, GpsrConnectionFailuresAreNotCommandErrors) {
+  EXPECT_TRUE(TaskAcquisition::isGpsrConnectionFailure("[Errno 111] Connection refused"));
+  EXPECT_TRUE(TaskAcquisition::isGpsrConnectionFailure("All connection attempts failed"));
+  EXPECT_TRUE(TaskAcquisition::isGpsrConnectionFailure("Temporary failure in name resolution"));
+  EXPECT_FALSE(TaskAcquisition::isGpsrConnectionFailure("unknown destination: kitchen"));
+  EXPECT_FALSE(TaskAcquisition::isGpsrConnectionFailure("unsupported command"));
+  EXPECT_FALSE(TaskAcquisition::isGpsrConnectionFailure("invalid JSON response"));
+}
 TEST(RecoveryModules, DoorCountsThreeChecksAndHonorsDebug) {
   for (bool debug : {false, true}) {
     Fixture f; f.debug = debug; DoorSequence door(f.context);

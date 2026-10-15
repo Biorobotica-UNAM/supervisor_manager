@@ -22,6 +22,9 @@ public:
   void reset() {active_ = false; retry_pending_ = false; attempts_ = 0;}
   bool handleFeedback(const Report & report);
   bool tick();
+  // Run the same policy before a plan exists; local hooks cannot mutate a plan.
+  bool beforeNavigation(const std::function<Report(double)> & check);
+  bool beforeNavigation();
 private:
   static std::string normalize(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {return std::tolower(c);}); return text;

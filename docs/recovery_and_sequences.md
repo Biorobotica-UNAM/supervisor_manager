@@ -206,11 +206,41 @@ Voz, escucha, extracción, validación y sus estados viven en `NavigationRecover
 La política `NavigationRecovery` lee `ask_location`, `retry` y `abort` del YAML.
 Esos comportamientos están implementados en C++; el YAML los selecciona, no
 crea operaciones nuevas. El destino corregido afecta al paso fallido y sus
-reintentos, sin cambiar destinos en pasos futuros.
+reintentos. Tras una llegada exitosa al destino corregido, el manager propone
+la operación `arrival_destination` en el siguiente lote confirmado del plan.
+`supervisor_plan` cambia únicamente el paso inmediatamente siguiente si es
+`Justina say I have arrived at <destino original>`. No busca coincidencias en
+el resto del plan ni modifica otros mensajes o navegaciones. Si no existe ese
+anuncio, la operación no hace cambios. Esto evita anunciar el destino rechazado
+después de llegar al corregido. Ambos nodos deben actualizarse juntos.
 
 La comprobación adicional de llegada utiliza TF y tolerancia de distancia. Si
 no existe la TF necesaria, se conserva el comportamiento anterior de aceptar
 el éxito validado del ejecutor con una advertencia; no se inventa una posición.
+
+## Servidor GPSR no disponible
+
+Si el parser responde `status: aborted` y `error_code: gpsr_unavailable`, la
+adquisición anuncia que no puede conectarse al servidor GPSR y termina el nodo
+supervisor. No vuelve a escuchar ni solicita otro comando, incluso con
+`continue_on_recovery_failure=true`. También reconoce respuestas antiguas cuyo
+`reason` contiene `Connection refused`, `[Errno 111]` u otros errores de conexión.
+El parser marca con este código errores de transporte HTTP (conexión, DNS o
+timeout); los rechazos semánticos conservan sus reintentos normales. Si falla
+el aviso de voz, igualmente se cierra el supervisor. El cierre afecta a
+`supervisor_manager_node`, no a los demás nodos del robot.
+
+## Puerta durante el arranque GPSR
+
+El arranque GPSR (`natural_language_planning=true`) también ejecuta `DoorSequence`
+antes de navegar a `instruction_point`, siempre que todavía no esté en ese punto.
+Consulta `/hardware/door_detector/check` (`std_srvs/Trigger`), el mismo sensor que
+utiliza la acción `check door`, con los límites y frases de la sección `door`.
+Una puerta cerrada, servicio ausente o timeout consume un intento. Tras tres
+intentos fallidos, `continue_on_recovery_failure=false` impide navegar y finaliza;
+con `true` permite continuar a navegación para depurar el plan. Este chequeo
+inicial no inserta ni avanza instrucciones de un plan que aún no existe.
+Prueba sin hardware: `ROS_DOMAIN_ID=231 python3 test/gpsr_door_smoke.py opens`.
 
 ## Manipulación y personas
 

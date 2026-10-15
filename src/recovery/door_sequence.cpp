@@ -1,6 +1,65 @@
 #include "supervisor_manager/door_sequence.hpp"
+#include <thread>
 
 namespace supervisor_manager {
+
+bool DoorSequence::beforeNavigation()
+{
+  return beforeNavigation([this](double timeout) {
+      Report report;
+      report.action = "check"; report.argument = "door";
+      report.approved = false; report.status = Report::FAILURE;
+      report.failure_reason = "check_service_failed";
+      report.worker_result = "check_service_failed: door";
+      const auto client = context_.door_check;
+      const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(timeout));
+      if (!client || !client->wait_for_service(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(timeout)))) {
+        return report;
+      }
+      auto future = client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+      if (future.wait_until(deadline) != std::future_status::ready) {
+        client->remove_pending_request(future);
+        report.failure_reason = "timeout";
+        return report;
+      }
+      const auto response = future.get();
+      report.approved = response->success;
+      report.status = response->success ? Report::SUCCESS : Report::FAILURE;
+      report.failure_reason = response->success ? "door_open" : "door_closed";
+      report.worker_result = report.failure_reason + ": " + response->message;
+      return report;
+  });
+}
+
+
+bool DoorSequence::beforeNavigation(const std::function<Report(double)> & check)
+{
+  RecoveryContext local = context_;
+  bool retry = false, finished = false, proceed = false;
+  local.retry = [&]() {retry = true;};
+  local.allow_next = []() {return true;};
+  local.finish_failed = [&](bool debug) {finished = true; proceed = debug;};
+  DoorSequence sequence(local);
+  while (rclcpp::ok()) {
+    RCLCPP_INFO(get_logger(), "[Pipeline][Door] Checking door before navigation");
+    const auto report = check(sequence.executionTimeout());
+    if (!sequence.handleFeedback(report)) {return true;}
+    if (finished) {
+      RCLCPP_WARN(get_logger(), "[Pipeline][Door] Attempts exhausted; navigation %s",
+        proceed ? "allowed by continue_on_recovery_failure" : "blocked");
+      return proceed;
+    }
+    while (rclcpp::ok() && !retry) {
+      sequence.tick();
+      if (!retry) {std::this_thread::sleep_for(std::chrono::milliseconds(20));}
+    }
+    retry = false;
+  }
+  return false;
+}
 
 bool DoorSequence::matches(const Report & report)
 {

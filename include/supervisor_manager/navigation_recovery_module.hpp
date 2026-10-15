@@ -24,6 +24,7 @@ public:
     general_rules_.reset(); navigation_recovery_->reset();
     if (navigation_entity_future_ && context_.entities) {context_.entities->prune_pending_requests();}
     navigation_entity_future_.reset(); navigation_speech_.clear();
+    arrival_original_.clear(); arrival_corrected_.clear();
     navigation_io_state_ = NavigationIoState::IDLE;
   }
 
@@ -44,6 +45,7 @@ private:
   std::unique_ptr<supervisor_manager::NavigationRecovery> navigation_recovery_;
   supervisor_manager::NavigationRecovery::Decision navigation_decision_;
   std::string navigation_error_, navigation_argument_, navigation_prompt_, navigation_candidate_;
+  std::string arrival_original_, arrival_corrected_;
   std::optional<rclcpp::Client<known_locations_interfaces::srv::LocationsGet>::SharedFuture> locations_validation_future_;
   std::chrono::steady_clock::time_point navigation_deadline_;
   std::optional<rclcpp::Client<talker_interfaces::srv::Talk>::SharedFuture> navigation_talk_future_;
